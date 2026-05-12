@@ -17,6 +17,12 @@ enum AppControllerError: LocalizedError {
     }
 }
 
+/// SSTOP from <sys/proc.h>. Darwin module doesn't re-export it; stable since BSD.
+private let kSSTOP: Int32 = 4
+/// macOS UID convention: 0-99 system, 200 _developer, 500+ regular users.
+/// Anything below is treated as system to block users from SIGSTOP'ing mDNSResponder/trustd etc.
+private let kFirstUserUID: uid_t = 500
+
 @MainActor
 enum AppController {
 
@@ -29,17 +35,13 @@ enum AppController {
 
     // MARK: - Pause / Resume
 
-    /// Pause an app's full process tree via SIGSTOP, then float a "Paused" overlay
-    /// over its windows so the user sees explicit feedback (not a frozen window).
-    /// Walks down through children (Browser Helper, GPU process, renderers...) so the whole app
-    /// freezes — not just the network-talking pids. Otherwise main GUI stays reactive until the
-    /// first network call, then beachballs.
+    /// Pause an app's full process tree via SIGSTOP. Walks children (Browser Helper, GPU,
+    /// renderers...) so the whole app freezes — otherwise the main GUI stays reactive until
+    /// the first network call, then beachballs (confusing UX).
     static func pause(bundleId: String, pids: Set<pid_t>) async {
-        log.info("[pause] entry bundle=\(bundleId, privacy: .public) input pids=\(pids.count, privacy: .public)")
         let tree = Self.processTree(rootPids: pids)
-        log.info("[pause] processTree size=\(tree.count, privacy: .public)")
         guard !tree.isEmpty else {
-            log.warning("[pause] empty tree, nothing to do")
+            log.warning("pause(\(bundleId, privacy: .public)): empty pid tree, nothing to do")
             return
         }
 
@@ -50,38 +52,33 @@ enum AppController {
             } else {
                 let err = errno
                 if err != ESRCH {
-                    log.error("[pause] SIGSTOP pid=\(pid, privacy: .public) failed: errno=\(err)")
+                    log.error("SIGSTOP pid=\(pid, privacy: .public) failed: errno=\(err)")
                 }
             }
         }
         pausedTracker[bundleId, default: []].formUnion(stopped)
-        log.info("[pause] SIGSTOP'd \(stopped.count, privacy: .public)/\(tree.count, privacy: .public) pids")
-
-        // SSoT mutation — UI re-renders within a frame.
         TrafficMonitor.shared.setPaused(bundleId: bundleId, isPaused: true)
+        log.info("paused \(bundleId, privacy: .public): \(stopped.count)/\(tree.count) pids")
     }
 
-    /// Resume an app's process tree via SIGCONT.
-    /// Unions current tree with previously-tracked pids in case some children spawned/died between pause and resume.
+    /// Resume an app's process tree via SIGCONT. Unions current tree with previously-tracked
+    /// pids in case children spawned/died between pause and resume.
     static func resume(bundleId: String, pids: Set<pid_t>) async {
-        log.info("[resume] entry bundle=\(bundleId, privacy: .public) input pids=\(pids.count, privacy: .public) tracked=\(pausedTracker[bundleId]?.count ?? 0, privacy: .public)")
-
         let tree = Self.processTree(rootPids: pids).union(pausedTracker[bundleId] ?? [])
-        log.info("[resume] tree size=\(tree.count, privacy: .public)")
-        var sentCount = 0
+        var sent = 0
         for pid in tree {
             if kill(pid, SIGCONT) == 0 {
-                sentCount += 1
+                sent += 1
             } else {
                 let err = errno
                 if err != ESRCH {
-                    log.error("[resume] SIGCONT pid=\(pid, privacy: .public) failed: errno=\(err)")
+                    log.error("SIGCONT pid=\(pid, privacy: .public) failed: errno=\(err)")
                 }
             }
         }
         pausedTracker.removeValue(forKey: bundleId)
         TrafficMonitor.shared.setPaused(bundleId: bundleId, isPaused: false)
-        log.info("[resume] DONE bundle=\(bundleId, privacy: .public) SIGCONT=\(sentCount, privacy: .public)/\(tree.count, privacy: .public)")
+        log.info("resumed \(bundleId, privacy: .public): \(sent)/\(tree.count) pids")
     }
 
     /// Whether a bundle is in user-intended paused state. UI uses this for toggle rendering.
@@ -89,17 +86,15 @@ enum AppController {
         pausedTracker.keys.contains(bundleId)
     }
 
-    /// Snapshot of (bundleId → tracked pids). TrafficMonitor uses this to keep paused
-    /// apps visible in the UI even after they stop emitting nettop data — without it,
-    /// SIGSTOP-d apps disappear from the list and the user can't click Resume.
+    /// Snapshot of (bundleId → tracked pids). Used to keep paused rows visible in UI
+    /// after SIGSTOP'd apps stop emitting nettop traffic — otherwise the row disappears
+    /// and the user has no Resume button.
     static func pausedBundlesSnapshot() -> [String: Set<pid_t>] {
         pausedTracker
     }
 
-    /// Crash recovery: NetWatch restarted (or was force-killed) while apps were paused.
-    /// Single sysctl(KERN_PROC_ALL) gives us pid + state + uid in one go — pick SSTOP'd
-    /// user-space GUI apps, resolve to bundleId via NSRunningApplication, rebuild tracker.
-    /// Without this, paused apps stay frozen but invisible to NetWatch.
+    /// Crash recovery: rebuild paused state when NetWatch restarted while apps were paused.
+    /// Without this, paused apps stay frozen but invisible to the UI.
     static func recoverPausedState() {
         let procs = Self.allProcesses()
         guard !procs.isEmpty else { return }
@@ -108,10 +103,8 @@ enum AppController {
         for p in procs {
             let pid = p.kp_proc.p_pid
             guard pid > 0 else { continue }
-            // SSTOP only — every other state means "not paused by us".
-            guard Int(p.kp_proc.p_stat) == 4 else { continue }
-            // User processes only — system daemons aren't ours to manage.
-            guard p.kp_eproc.e_ucred.cr_uid >= 500 else { continue }
+            guard Int32(p.kp_proc.p_stat) == kSSTOP else { continue }
+            guard p.kp_eproc.e_ucred.cr_uid >= kFirstUserUID else { continue }
 
             if let app = NSRunningApplication(processIdentifier: pid),
                let bundleId = app.bundleIdentifier {
@@ -138,6 +131,8 @@ enum AppController {
             log.info("terminate-resume \(bundleId, privacy: .public): \(pids.count) pids")
         }
         pausedTracker.removeAll()
+        // Keep pausedTracker.keys ≡ TrafficMonitor.pausedBundles invariant intact.
+        TrafficMonitor.shared.pausedBundles.removeAll()
     }
 
     /// Auto-pause newly-spawned pids belonging to a bundle that's already in paused intent.
@@ -195,17 +190,14 @@ enum AppController {
         return result
     }
 
-    /// macOS UID convention: 0-99 system services, 200 _developer, 500+ regular users.
-    /// We treat anything < 500 as system to prevent users from SIGSTOP'ing mDNSResponder etc.
     nonisolated static func isSystemProcess(pid: pid_t) -> Bool {
         guard let info = Self.kinfoProc(pid: pid) else { return false }
-        return info.kp_eproc.e_ucred.cr_uid < 500
+        return info.kp_eproc.e_ucred.cr_uid < kFirstUserUID
     }
 
-    /// Returns true iff process is in SSTOP state (4) — kernel SoT, not an in-memory mirror.
     nonisolated static func isPaused(pid: pid_t) -> Bool {
         guard let info = Self.kinfoProc(pid: pid) else { return false }
-        return Int(info.kp_proc.p_stat) == 4  // SSTOP from <sys/proc.h>
+        return Int32(info.kp_proc.p_stat) == kSSTOP
     }
 
     /// Read `kinfo_proc` for a single pid. Works for any pid without root.

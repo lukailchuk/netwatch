@@ -49,9 +49,9 @@ final class TrafficMonitor: ObservableObject {
     @Published var sessionTotal: Int64 = 0     // bytes since last reset
     @Published var connectionStats: [String: [ConnectionStat]] = [:]
 
-    /// SSoT for "is this bundle paused right now". Mirrors AppController.pausedTracker.keys.
-    /// AppController.pause/resume are the only writers (via setPaused). UI is pure reader.
-    /// Sample loop NEVER touches this — separation prevents race between snapshot timing and user intent.
+    /// Membership mirror of AppController.pausedTracker. Separate from `apps` so SwiftUI
+    /// re-renders within a frame on pause/resume — and so the sample loop, which rebuilds
+    /// `apps`, can't race with user intent.
     @Published var pausedBundles: Set<String> = []
 
     // Delta tracking (cumulative counters from nettop, used for diff between samples)
@@ -82,44 +82,20 @@ final class TrafficMonitor: ObservableObject {
         sampleTimer?.invalidate()
     }
 
-    /// Trigger a sample immediately (don't wait for the next 7s tick).
-    /// Called after pause/resume/kill actions so the UI reflects state within ~1-2s
-    /// (nettop's own sample window) instead of the full sample interval.
+    /// Trigger a sample immediately (don't wait for the next 7s tick). Called after
+    /// pause/resume/kill so the UI reflects new state within nettop's own ~1-2s window.
     func tickNow() {
         runSampleAsync()
     }
 
-    /// Optimistic UI flip — apply isPaused to the matching row immediately.
-    /// Sample loop will confirm with kernel state within 1-2s, but UI doesn't wait.
-    /// If bundleId isn't in self.apps yet (paused before any traffic recorded),
-    /// synthesize a row from AppController.pausedBundlesSnapshot + NSRunningApplication name.
-    /// SSoT mutation point for paused state. Called by AppController.pause/resume.
-    /// Mutates @Published Set → SwiftUI re-renders within a frame. No AppStat copy magic,
-    /// no race with sample loop — sample loop never reads/writes this Set.
-    /// Also synthesizes a stub AppStat row if bundleId isn't in self.apps yet
-    /// (paused fast after launch, no traffic recorded).
+    /// Membership-only flip; UI consumes `pausedBundles` and rerenders.
+    /// Stub AppStat rows (for apps paused before any traffic was recorded) are synthesized
+    /// downstream in `refreshAppsFromDB`, which runs ~immediately via `tickNow` after this call.
     func setPaused(bundleId: String, isPaused: Bool) {
         if isPaused {
             pausedBundles.insert(bundleId)
-            Self.log.info("[setPaused] inserted \(bundleId, privacy: .public), set size=\(self.pausedBundles.count, privacy: .public)")
-
-            // Make sure UI has a row for this bundle even if it wasn't in DB/sample.
-            if !apps.contains(where: { $0.bundleId == bundleId }) {
-                let trackedPids = AppController.pausedBundlesSnapshot()[bundleId] ?? []
-                let appName = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
-                    .first?.localizedName ?? bundleId
-                apps.append(AppStat(
-                    bundleId: bundleId,
-                    appName: appName,
-                    bytesIn: 0, bytesOut: 0, rate: 0,
-                    pids: trackedPids,
-                    isSystem: trackedPids.first.map { AppController.isSystemProcess(pid: $0) } ?? false
-                ))
-                Self.log.info("[setPaused] synthesized AppStat for \(bundleId, privacy: .public)")
-            }
         } else {
             pausedBundles.remove(bundleId)
-            Self.log.info("[setPaused] removed \(bundleId, privacy: .public), set size=\(self.pausedBundles.count, privacy: .public)")
         }
     }
 
@@ -386,8 +362,7 @@ final class TrafficMonitor: ObservableObject {
             // Cheap when bundle isn't in paused intent (early-return inside).
             AppController.reconcilePausedBundle(bundleId, currentPids: data.pids)
 
-            // Read system flag from kernel — UID won't change at runtime, one probe is enough.
-            // We DON'T probe paused state here — that's owned by self.pausedBundles via AppController.
+            // UID won't change at runtime — one probe per bundle is enough.
             if let probePid = data.pids.first {
                 appSystem[bundleId] = AppController.isSystemProcess(pid: probePid)
             }
@@ -455,8 +430,7 @@ final class TrafficMonitor: ObservableObject {
         self.sessionTotal = sessionAppBytes.values.reduce(0, +)
 
         // SIGSTOP'd processes stop emitting traffic → disappear from nettop's next sample.
-        // Patch their pids back into the snapshot so the row stays in self.apps and the user
-        // can click Resume. Paused state itself lives in self.pausedBundles, NOT here.
+        // Patch their pids back so the row survives and the user can click Resume.
         let pausedSnapshot = AppController.pausedBundlesSnapshot()
         for (bundleId, trackedPids) in pausedSnapshot {
             if appPids[bundleId] == nil { appPids[bundleId] = trackedPids }
@@ -466,12 +440,10 @@ final class TrafficMonitor: ObservableObject {
         }
 
         refreshAppsFromDB(rates: appRates, pids: appPids, system: appSystem)
-        Self.log.info("[snapshot] sample done: appSample=\(appSample.count, privacy: .public) pausedBundles=\(self.pausedBundles.count, privacy: .public) self.apps=\(self.apps.count, privacy: .public)")
     }
 
     /// Reloads `apps` from DB and applies current rates + pids + system flag + sort by rate DESC.
-    /// Builds a [bundleId: AppStat] dictionary first, then converts to array — guarantees no
-    /// duplicates by construction. Paused state is NOT here — it lives in self.pausedBundles.
+    /// Dictionary build first guarantees no duplicates by construction.
     private func refreshAppsFromDB(
         rates: [String: Double],
         pids: [String: Set<Int32>],
@@ -482,7 +454,6 @@ final class TrafficMonitor: ObservableObject {
 
         var byBundle: [String: AppStat] = [:]
 
-        // Seed from DB (today's history).
         for existing in stats {
             byBundle[existing.bundleId] = AppStat(
                 bundleId: existing.bundleId,
@@ -495,7 +466,7 @@ final class TrafficMonitor: ObservableObject {
             )
         }
 
-        // Inject paused bundles that DB doesn't yet know about (paused fast after launch, no traffic recorded).
+        // Apps paused before any traffic was recorded won't be in DB — synthesize a stub.
         for (bundleId, trackedPids) in AppController.pausedBundlesSnapshot() where byBundle[bundleId] == nil {
             let appName = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
                 .first?.localizedName ?? bundleId
@@ -521,7 +492,6 @@ final class TrafficMonitor: ObservableObject {
 
         self.todayTotal = stats.reduce(Int64(0)) { $0 + $1.total }
         self.weekTotal = week.reduce(Int64(0)) { $0 + $1.total }
-        Self.log.info("[refresh] published self.apps count=\(self.apps.count, privacy: .public) pausedBundles=\(self.pausedBundles.count, privacy: .public)")
     }
 
     private func refreshStats() {

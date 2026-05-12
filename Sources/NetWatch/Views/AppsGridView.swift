@@ -1,8 +1,5 @@
 import SwiftUI
 import AppKit
-import os
-
-private let uiLog = Logger(subsystem: "io.netwatch", category: "ui")
 
 struct AppsGridView: View {
     @EnvironmentObject var monitor: TrafficMonitor
@@ -16,8 +13,6 @@ struct AppsGridView: View {
                     emptyState
                         .padding(.top, Spacing.xxxl)
                 } else {
-                    // SAME Set used for filter AND for AppRow's isPaused param —
-                    // filter and render can't disagree, race impossible.
                     let pausedSet = monitor.pausedBundles
                     let paused = monitor.apps.filter { pausedSet.contains($0.bundleId) }
                     let active = monitor.apps.filter { !pausedSet.contains($0.bundleId) }
@@ -120,7 +115,6 @@ struct AppsGridView: View {
     }
 
     private func handle(action: AppRowAction, for app: AppStat) {
-        uiLog.info("[click] action=\(String(describing: action), privacy: .public) bundle=\(app.bundleId, privacy: .public) pids=\(app.pids.count, privacy: .public) currentlyPaused=\(self.monitor.pausedBundles.contains(app.bundleId), privacy: .public)")
         Task { @MainActor in
             processingId = app.id
             defer { processingId = nil }
@@ -133,7 +127,6 @@ struct AppsGridView: View {
             case .kill:
                 await AppController.killProcesses(pids: app.pids, bundleId: app.bundleId)
             }
-            uiLog.info("[click] action done bundle=\(app.bundleId, privacy: .public) pausedBundles size=\(self.monitor.pausedBundles.count, privacy: .public)")
             monitor.tickNow()
         }
     }
@@ -152,8 +145,8 @@ struct AppRow: View {
     let onAction: (AppRowAction) -> Void
     let onToggleExpand: () -> Void
 
-    // Read paused state LIVE from monitor — never trust a captured init prop because
-    // SwiftUI ForEach can reuse this view across sections (paused/active) and pass stale value.
+    // Read paused state live from monitor — ForEach can reuse this view across
+    // paused/active sections, so a captured init prop would be stale on reuse.
     @EnvironmentObject var monitor: TrafficMonitor
     private var isPaused: Bool { monitor.pausedBundles.contains(app.bundleId) }
 
