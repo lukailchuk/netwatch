@@ -1,5 +1,6 @@
 import Foundation
 import SQLite3
+import os
 
 final class Database: @unchecked Sendable {
     static let shared = Database()
@@ -7,6 +8,7 @@ final class Database: @unchecked Sendable {
     private var db: OpaquePointer?
     private let queue = DispatchQueue(label: "netwatch.db", qos: .utility)
     private let path: String
+    private let log = Logger(subsystem: "io.netwatch", category: "database")
 
     /// POSIX locale + dateFormat keeps date keys ASCII-only on devices configured with
     /// non-Latin Number formats (Arabic Indic, Persian, Thai). Without this, writes use
@@ -33,7 +35,7 @@ final class Database: @unchecked Sendable {
         self.path = appSupport.appendingPathComponent("stats.sqlite").path
 
         if sqlite3_open(path, &db) != SQLITE_OK {
-            print("[Database] Cannot open at \(path)")
+            log.error("Cannot open at \(self.path, privacy: .public)")
             return
         }
 
