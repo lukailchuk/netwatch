@@ -30,6 +30,7 @@ enum Palette {
     static let highTraffic = Color.orange
     static let danger = Color.red
     static let success = Color.green
+    static let warning = Color.yellow
     static let accent = Color.accentColor
 
     static let surfaceSubtle = Color.primary.opacity(0.04)

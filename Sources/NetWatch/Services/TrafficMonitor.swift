@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import AppKit
+import os
 
 enum Period: String, CaseIterable, Identifiable, Hashable {
     case session, today, week
@@ -38,6 +39,8 @@ enum Period: String, CaseIterable, Identifiable, Hashable {
 @MainActor
 final class TrafficMonitor: ObservableObject {
     static let shared = TrafficMonitor()
+
+    nonisolated private static let log = Logger(subsystem: "io.netwatch", category: "traffic-monitor")
 
     @Published var liveRate: Double = 0       // total bytes/sec
     @Published var apps: [AppStat] = []        // sorted by rate DESC
@@ -112,6 +115,7 @@ final class TrafficMonitor: ObservableObject {
             return apps
                 .filter { $0.total > 0 }
                 .map { PeriodApp(bundleId: $0.bundleId, appName: $0.appName, total: $0.total) }
+                .sorted { $0.total > $1.total }
         case .week:
             return Database.shared.getAppTotalsForWeek()
         }
@@ -157,7 +161,7 @@ final class TrafficMonitor: ObservableObject {
             try proc.run()
             proc.waitUntilExit()
         } catch {
-            print("[TrafficMonitor] nettop spawn failed: \(error)")
+            Self.log.error("nettop spawn failed: \(error.localizedDescription, privacy: .public)")
             return ""
         }
         let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
@@ -326,10 +330,24 @@ final class TrafficMonitor: ObservableObject {
         var totalDeltaBytes: Int64 = 0
         var appRates: [String: Double] = [:]
         var appPids: [String: Set<Int32>] = [:]
+        var appPaused: [String: Bool] = [:]
+        var appSystem: [String: Bool] = [:]
 
         // Per-app deltas → DB + session + rate
         for (bundleId, data) in appSample {
             appPids[bundleId] = data.pids
+
+            // Auto-pause any new pids that spawned under a bundle the user already paused.
+            // Cheap when bundle isn't in paused intent (early-return inside).
+            AppController.reconcilePausedBundle(bundleId, currentPids: data.pids)
+
+            // Read paused/system state from kernel — single sysctl per bundle, not per pid.
+            // Process tree is homogeneous on UID and on (post-reconcile) paused status, so any pid suffices.
+            if let probePid = data.pids.first {
+                appPaused[bundleId] = AppController.isPaused(pid: probePid)
+                appSystem[bundleId] = AppController.isSystemProcess(pid: probePid)
+            }
+
             if let prev = lastAppSnapshot[bundleId] {
                 let deltaIn = max(0, data.bytesIn - prev.bytesIn)
                 let deltaOut = max(0, data.bytesOut - prev.bytesOut)
@@ -392,11 +410,16 @@ final class TrafficMonitor: ObservableObject {
         self.connectionStats = newConnStats
         self.sessionTotal = sessionAppBytes.values.reduce(0, +)
 
-        refreshAppsFromDB(rates: appRates, pids: appPids)
+        refreshAppsFromDB(rates: appRates, pids: appPids, paused: appPaused, system: appSystem)
     }
 
-    /// Reloads `apps` from DB and applies current rates + pids + sort by rate DESC.
-    private func refreshAppsFromDB(rates: [String: Double], pids: [String: Set<Int32>]) {
+    /// Reloads `apps` from DB and applies current rates + pids + paused/system flags + sort by rate DESC.
+    private func refreshAppsFromDB(
+        rates: [String: Double],
+        pids: [String: Set<Int32>],
+        paused: [String: Bool],
+        system: [String: Bool]
+    ) {
         let stats = Database.shared.getTodayStats()
         let week = Database.shared.getWeeklyTotals()
 
@@ -407,7 +430,9 @@ final class TrafficMonitor: ObservableObject {
                 bytesIn: existing.bytesIn,
                 bytesOut: existing.bytesOut,
                 rate: rates[existing.bundleId] ?? 0,
-                pids: pids[existing.bundleId] ?? []
+                pids: pids[existing.bundleId] ?? [],
+                isPaused: paused[existing.bundleId] ?? false,
+                isSystem: system[existing.bundleId] ?? false
             )
         }.sorted {
             // Active (rate > 0) на верх, далі by session bytes, далі by today total
@@ -423,6 +448,6 @@ final class TrafficMonitor: ObservableObject {
     }
 
     private func refreshStats() {
-        refreshAppsFromDB(rates: [:], pids: [:])
+        refreshAppsFromDB(rates: [:], pids: [:], paused: [:], system: [:])
     }
 }

@@ -56,6 +56,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Don't leave the user with frozen apps after we quit. Best-effort SIGCONT to anything we paused.
+        AppController.resumeAllPaused()
         monitor?.stop()
     }
 

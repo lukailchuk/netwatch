@@ -82,6 +82,10 @@ struct AppsGridView: View {
             defer { processingId = nil }
 
             switch action {
+            case .pause:
+                await AppController.pause(bundleId: app.bundleId, pids: app.pids)
+            case .resume:
+                await AppController.resume(bundleId: app.bundleId, pids: app.pids)
             case .kill:
                 await AppController.killProcesses(pids: app.pids, bundleId: app.bundleId)
             }
@@ -90,6 +94,8 @@ struct AppsGridView: View {
 }
 
 enum AppRowAction {
+    case pause
+    case resume
     case kill
 }
 
@@ -102,6 +108,8 @@ struct AppRow: View {
 
     @State private var icon: NSImage?
     @State private var isHovered: Bool = false
+    @State private var showPauseInfo: Bool = false
+    @AppStorage("netwatch.firstPauseShown") private var firstPauseShown: Bool = false
 
     private let rateNoiseFloor: Double = 100
 
@@ -212,34 +220,99 @@ struct AppRow: View {
             ProgressView()
                 .controlSize(.small)
                 .frame(width: 26, height: 26)
-        } else if app.isLive {
-            actionIcon(systemName: "stop.circle.fill", tint: Palette.danger, help: "Kill \(app.appName)") {
-                onAction(.kill)
-            }
+        } else if app.isSystem {
+            disabledIcon(
+                systemName: "lock.circle.fill",
+                help: "\(app.appName) — system process, managed by macOS"
+            )
+        } else if !app.isLive {
+            disabledIcon(
+                systemName: "power.circle.fill",
+                help: "No active process for \(app.appName)"
+            )
         } else {
-            inactiveIcon
+            HStack(spacing: 4) {
+                pauseToggle
+                killSecondary
+            }
         }
     }
 
-    private var inactiveIcon: some View {
-        Image(systemName: "stop.circle.fill")
-            .font(.system(size: 18, weight: .medium))
-            .foregroundStyle(.tertiary, Color.secondary.opacity(0.1))
-            .symbolRenderingMode(.palette)
-            .frame(width: 26, height: 26)
-            .help("No active process for \(app.appName)")
-    }
-
-    private func actionIcon(systemName: String, tint: Color, help: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: systemName)
-                .font(.system(size: 18, weight: .medium))
-                .foregroundStyle(tint, tint.opacity(0.15))
+    private var pauseToggle: some View {
+        Button {
+            if !app.isPaused && !firstPauseShown {
+                showPauseInfo = true
+                firstPauseShown = true
+            }
+            onAction(app.isPaused ? .resume : .pause)
+        } label: {
+            Image(systemName: app.isPaused ? "pause.circle.fill" : "power.circle.fill")
+                .font(.system(size: 22, weight: .medium))
+                .foregroundStyle(
+                    app.isPaused ? Palette.warning : Palette.danger,
+                    (app.isPaused ? Palette.warning : Palette.danger).opacity(0.15)
+                )
                 .symbolRenderingMode(.palette)
                 .frame(width: 26, height: 26)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(help)
+        .help(app.isPaused ? "Resume \(app.appName)" : "Pause \(app.appName) (freezes the whole process)")
+        .popover(isPresented: $showPauseInfo, arrowEdge: .trailing) {
+            pauseInfoPopover
+        }
+    }
+
+    private var killSecondary: some View {
+        Button {
+            onAction(.kill)
+        } label: {
+            Image(systemName: "xmark.circle.fill")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(
+                    isHovered ? Palette.danger : Color.secondary,
+                    (isHovered ? Palette.danger : Color.secondary).opacity(0.15)
+                )
+                .symbolRenderingMode(.palette)
+                .frame(width: 18, height: 18)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Kill \(app.appName)")
+    }
+
+    private func disabledIcon(systemName: String, help: String) -> some View {
+        Image(systemName: systemName)
+            .font(.system(size: 18, weight: .medium))
+            .foregroundStyle(.tertiary, Color.secondary.opacity(0.1))
+            .symbolRenderingMode(.palette)
+            .frame(width: 26, height: 26)
+            .help(help)
+    }
+
+    private var pauseInfoPopover: some View {
+        VStack(alignment: .leading, spacing: Spacing.sm) {
+            HStack(spacing: 6) {
+                Image(systemName: "info.circle.fill")
+                    .foregroundStyle(Palette.warning)
+                Text("Heads up — это pause, не firewall")
+                    .font(.headline)
+            }
+            Text("Pause freezes the **whole process** (UI included), not just network. The app's window will become unresponsive until you resume.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("True per-process firewalling needs a Network Extension — planned for a future version.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("Got it") { showPauseInfo = false }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(Spacing.md)
+        .frame(width: 320)
     }
 }

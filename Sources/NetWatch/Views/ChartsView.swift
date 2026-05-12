@@ -6,6 +6,7 @@ struct ChartsView: View {
     @Binding var selectedPeriod: Period
     @State private var weekApps: [PeriodApp] = []
     @State private var weekTimeline: [WeekPoint] = []
+    @State private var selectedDay: String?
 
     struct WeekPoint: Identifiable {
         var id: String { date }
@@ -14,6 +15,16 @@ struct ChartsView: View {
 
         var dayLabel: String {
             String(date.suffix(5))
+        }
+
+        var fullDateLabel: String {
+            let inFmt = DateFormatter()
+            inFmt.dateFormat = "yyyy-MM-dd"
+            inFmt.locale = Locale(identifier: "en_US_POSIX")
+            guard let d = inFmt.date(from: date) else { return date }
+            let outFmt = DateFormatter()
+            outFmt.setLocalizedDateFormatFromTemplate("EEEMMMd")
+            return outFmt.string(from: d)
         }
     }
 
@@ -80,36 +91,37 @@ struct ChartsView: View {
 
     private var weekChart: some View {
         Chart(weekTimeline) { point in
-            AreaMark(
+            let isDimmed = selectedDay != nil && selectedDay != point.dayLabel
+
+            BarMark(
                 x: .value("Day", point.dayLabel),
-                y: .value("Bytes", point.total)
+                y: .value("Bytes", point.total),
+                width: .ratio(0.6)
             )
             .foregroundStyle(
                 .linearGradient(
                     colors: [
-                        Color.accentColor.opacity(0.45),
-                        Color.accentColor.opacity(0.02)
+                        Color.accentColor.opacity(isDimmed ? 0.3 : 1),
+                        Color.accentColor.opacity(isDimmed ? 0.18 : 0.65)
                     ],
                     startPoint: .top,
                     endPoint: .bottom
                 )
             )
-            .interpolationMethod(.monotone)
+            .cornerRadius(3)
 
-            LineMark(
-                x: .value("Day", point.dayLabel),
-                y: .value("Bytes", point.total)
-            )
-            .foregroundStyle(Color.accentColor)
-            .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
-            .interpolationMethod(.monotone)
-
-            PointMark(
-                x: .value("Day", point.dayLabel),
-                y: .value("Bytes", point.total)
-            )
-            .foregroundStyle(Color.accentColor)
-            .symbolSize(28)
+            if let selectedDay, point.dayLabel == selectedDay {
+                RuleMark(x: .value("Day", point.dayLabel))
+                    .foregroundStyle(Color.primary.opacity(0.18))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                    .annotation(
+                        position: .top,
+                        spacing: 6,
+                        overflowResolution: .init(x: .fit(to: .chart), y: .disabled)
+                    ) {
+                        tooltipCard(for: point)
+                    }
+            }
         }
         .chartYAxis {
             AxisMarks(position: .leading, values: .automatic(desiredCount: 3)) { value in
@@ -132,7 +144,57 @@ struct ChartsView: View {
             }
         }
         .frame(height: 160)
+        .chartOverlay { proxy in
+            GeometryReader { geo in
+                Rectangle()
+                    .fill(Color.clear)
+                    .contentShape(Rectangle())
+                    .onContinuousHover { phase in
+                        switch phase {
+                        case .active(let location):
+                            guard let plotAnchor = proxy.plotFrame else { return }
+                            let plot = geo[plotAnchor]
+                            let xInPlot = location.x - plot.minX
+                            guard xInPlot >= 0, xInPlot <= plot.width else {
+                                if selectedDay != nil { selectedDay = nil }
+                                return
+                            }
+                            let day: String? = proxy.value(atX: xInPlot, as: String.self)
+                            if selectedDay != day { selectedDay = day }
+                        case .ended:
+                            if selectedDay != nil { selectedDay = nil }
+                        }
+                    }
+            }
+        }
         .animation(.easeInOut(duration: 0.4), value: weekTimeline.map(\.total))
+        .animation(.netHover, value: selectedDay)
+    }
+
+    private func tooltipCard(for point: WeekPoint) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(point.fullDateLabel)
+                .font(.system(size: 9, weight: .medium, design: .rounded))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+                .tracking(0.3)
+            Text(point.total.formattedBytes())
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(.primary)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(.regularMaterial)
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+        }
+        .shadow(color: .black.opacity(0.18), radius: 4, x: 0, y: 2)
+        .fixedSize()
     }
 
     private var appBreakdownSection: some View {

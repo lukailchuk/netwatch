@@ -8,6 +8,8 @@ struct AppStat: Identifiable, Equatable, Hashable {
     let bytesOut: Int64
     let rate: Double  // bytes/sec, last sample
     let pids: Set<Int32>  // live pids from current nettop sample (empty for DB-only history)
+    let isPaused: Bool   // SSTOP state via sysctl (any pid stopped → bundle considered paused)
+    let isSystem: Bool   // UID < 500 → block UI controls (mDNSResponder, trustd, etc.)
 
     var total: Int64 { bytesIn + bytesOut }
     var isLive: Bool { !pids.isEmpty }
