@@ -118,8 +118,50 @@ final class Database: @unchecked Sendable {
                     appName: appName,
                     bytesIn: bytesIn,
                     bytesOut: bytesOut,
-                    rate: 0  // injected later by TrafficMonitor.refreshAppsFromDB
+                    rate: 0,  // injected later by TrafficMonitor.refreshAppsFromDB
+                    pids: []  // injected later by TrafficMonitor.refreshAppsFromDB
                 ))
+            }
+        }
+        return results
+    }
+
+    func getAppTotalsForWeek() -> [PeriodApp] {
+        let calendar = Calendar.current
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+
+        var dates: [String] = []
+        for i in (0..<7).reversed() {
+            if let d = calendar.date(byAdding: .day, value: -i, to: Date()) {
+                dates.append(formatter.string(from: d))
+            }
+        }
+        guard !dates.isEmpty else { return [] }
+
+        var results: [PeriodApp] = []
+        queue.sync {
+            let placeholders = dates.map { _ in "?" }.joined(separator: ",")
+            let sql = """
+                SELECT bundle_id, MAX(app_name) AS name, SUM(bytes_in + bytes_out) AS total
+                FROM daily_aggregates
+                WHERE date IN (\(placeholders))
+                GROUP BY bundle_id
+                ORDER BY total DESC
+            """
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(self.db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+
+            for (i, date) in dates.enumerated() {
+                sqlite3_bind_text(stmt, Int32(i + 1), (date as NSString).utf8String, -1, nil)
+            }
+
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let bundleId = String(cString: sqlite3_column_text(stmt, 0))
+                let appName = String(cString: sqlite3_column_text(stmt, 1))
+                let total = sqlite3_column_int64(stmt, 2)
+                results.append(PeriodApp(bundleId: bundleId, appName: appName, total: total))
             }
         }
         return results

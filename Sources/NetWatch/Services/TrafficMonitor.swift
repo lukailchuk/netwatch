@@ -2,6 +2,36 @@ import Foundation
 import Combine
 import AppKit
 
+enum Period: String, CaseIterable, Identifiable, Hashable {
+    case session, today, week
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .session: return "Session"
+        case .today: return "Today"
+        case .week: return "Week"
+        }
+    }
+
+    var breakdownTitle: String {
+        switch self {
+        case .session: return "Session — by app"
+        case .today: return "Today — by app"
+        case .week: return "Last 7 days — by app"
+        }
+    }
+
+    var emptyMessage: String {
+        switch self {
+        case .session: return "No traffic this session yet"
+        case .today: return "No traffic recorded today"
+        case .week: return "No history this week"
+        }
+    }
+}
+
 /// Single shared sampler. One `nettop` process per tick (5s) emits both
 /// per-process aggregates AND per-connection breakdowns — we parse both
 /// in one pass. Drilldown views read existing state, no extra sampling.
@@ -50,6 +80,41 @@ final class TrafficMonitor: ObservableObject {
         sessionTotal = 0
         connectionStats.removeAll()
         refreshStats()
+    }
+
+    // MARK: - Period queries
+
+    func totalForPeriod(_ period: Period) -> Int64 {
+        switch period {
+        case .session: return sessionTotal
+        case .today: return todayTotal
+        case .week: return weekTotal
+        }
+    }
+
+    /// Per-app breakdown for a given period. Session derives from in-memory
+    /// session accumulators; Today reuses the live `apps` array; Week hits the DB.
+    func appsForPeriod(_ period: Period) -> [PeriodApp] {
+        switch period {
+        case .session:
+            let nameByBundle = Dictionary(uniqueKeysWithValues: apps.map { ($0.bundleId, $0.appName) })
+            return sessionAppBytes
+                .filter { $0.value > 0 }
+                .map { bundleId, bytes in
+                    PeriodApp(
+                        bundleId: bundleId,
+                        appName: nameByBundle[bundleId] ?? bundleId,
+                        total: bytes
+                    )
+                }
+                .sorted { $0.total > $1.total }
+        case .today:
+            return apps
+                .filter { $0.total > 0 }
+                .map { PeriodApp(bundleId: $0.bundleId, appName: $0.appName, total: $0.total) }
+        case .week:
+            return Database.shared.getAppTotalsForWeek()
+        }
     }
 
     // MARK: - Sample loop
@@ -105,7 +170,7 @@ final class TrafficMonitor: ObservableObject {
         let lines = chunk.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
 
         // Aggregates we build during this sample, then diff against lastSnapshots.
-        var appSample: [String: (bytesIn: Int64, bytesOut: Int64, name: String)] = [:]
+        var appSample: [String: (bytesIn: Int64, bytesOut: Int64, name: String, pids: Set<Int32>)] = [:]
         var connSample: [String: [String: (bytesIn: Int64, bytesOut: Int64, port: Int, proto: String)]] = [:]
         var currentBundleId: String?
 
@@ -134,7 +199,7 @@ final class TrafficMonitor: ObservableObject {
 
             if !isConnRow {
                 // Process aggregate row
-                let cleanName = stripPID(from: nameOrConn.trimmingCharacters(in: .whitespaces))
+                let (cleanName, pid) = splitNameAndPID(from: nameOrConn.trimmingCharacters(in: .whitespaces))
                 guard !cleanName.isEmpty, cleanName != "nettop" else {
                     currentBundleId = nil
                     continue
@@ -142,13 +207,16 @@ final class TrafficMonitor: ObservableObject {
                 let (bundleId, displayName) = resolveParentApp(processName: cleanName)
                 currentBundleId = bundleId
 
-                // Aggregate (helper procs roll into parent here)
+                // Aggregate (helper procs roll into parent here, all pids accumulated)
                 if var existing = appSample[bundleId] {
                     existing.bytesIn += bytesIn
                     existing.bytesOut += bytesOut
+                    if let pid { existing.pids.insert(pid) }
                     appSample[bundleId] = existing
                 } else {
-                    appSample[bundleId] = (bytesIn, bytesOut, displayName)
+                    var pids: Set<Int32> = []
+                    if let pid { pids.insert(pid) }
+                    appSample[bundleId] = (bytesIn, bytesOut, displayName, pids)
                 }
             } else {
                 // Connection row under the most recent process header
@@ -204,12 +272,15 @@ final class TrafficMonitor: ObservableObject {
         return ParsedEndpoint(host: host, port: port, proto: proto)
     }
 
-    private func stripPID(from raw: String) -> String {
+    /// nettop format "ProcessName.PID" → (name, pid). Returns (raw, nil) if no numeric suffix.
+    private func splitNameAndPID(from raw: String) -> (name: String, pid: Int32?) {
         if let dotIdx = raw.lastIndex(of: ".") {
-            let suffix = raw[raw.index(after: dotIdx)...]
-            if Int(suffix) != nil { return String(raw[..<dotIdx]) }
+            let suffix = String(raw[raw.index(after: dotIdx)...])
+            if let pid = Int32(suffix) {
+                return (String(raw[..<dotIdx]), pid)
+            }
         }
-        return raw
+        return (raw, nil)
     }
 
     /// Walks the executable path up to the outermost .app bundle. Helper
@@ -247,16 +318,18 @@ final class TrafficMonitor: ObservableObject {
     // MARK: - Delta computation
 
     private func processSnapshot(
-        appSample: [String: (bytesIn: Int64, bytesOut: Int64, name: String)],
+        appSample: [String: (bytesIn: Int64, bytesOut: Int64, name: String, pids: Set<Int32>)],
         connSample: [String: [String: (bytesIn: Int64, bytesOut: Int64, port: Int, proto: String)]]
     ) {
         let now = Date()
         let timeDelta = now.timeIntervalSince(lastSampleAt)
         var totalDeltaBytes: Int64 = 0
         var appRates: [String: Double] = [:]
+        var appPids: [String: Set<Int32>] = [:]
 
         // Per-app deltas → DB + session + rate
         for (bundleId, data) in appSample {
+            appPids[bundleId] = data.pids
             if let prev = lastAppSnapshot[bundleId] {
                 let deltaIn = max(0, data.bytesIn - prev.bytesIn)
                 let deltaOut = max(0, data.bytesOut - prev.bytesOut)
@@ -319,11 +392,11 @@ final class TrafficMonitor: ObservableObject {
         self.connectionStats = newConnStats
         self.sessionTotal = sessionAppBytes.values.reduce(0, +)
 
-        refreshAppsFromDB(rates: appRates)
+        refreshAppsFromDB(rates: appRates, pids: appPids)
     }
 
-    /// Reloads `apps` from DB and applies current rates + sort by rate DESC.
-    private func refreshAppsFromDB(rates: [String: Double]) {
+    /// Reloads `apps` from DB and applies current rates + pids + sort by rate DESC.
+    private func refreshAppsFromDB(rates: [String: Double], pids: [String: Set<Int32>]) {
         let stats = Database.shared.getTodayStats()
         let week = Database.shared.getWeeklyTotals()
 
@@ -333,7 +406,8 @@ final class TrafficMonitor: ObservableObject {
                 appName: existing.appName,
                 bytesIn: existing.bytesIn,
                 bytesOut: existing.bytesOut,
-                rate: rates[existing.bundleId] ?? 0
+                rate: rates[existing.bundleId] ?? 0,
+                pids: pids[existing.bundleId] ?? []
             )
         }.sorted {
             // Active (rate > 0) на верх, далі by session bytes, далі by today total
@@ -349,6 +423,6 @@ final class TrafficMonitor: ObservableObject {
     }
 
     private func refreshStats() {
-        refreshAppsFromDB(rates: [:])
+        refreshAppsFromDB(rates: [:], pids: [:])
     }
 }

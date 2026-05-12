@@ -2,91 +2,193 @@ import SwiftUI
 
 struct HeaderView: View {
     @EnvironmentObject var monitor: TrafficMonitor
+    @Binding var selectedPeriod: Period
+    @Binding var inSettings: Bool
+    let onPeriodTap: (Period) -> Void
+
     @AppStorage("travelModeActive") private var travelModeOn: Bool = false
     @AppStorage("costPerGB") private var costPerGB: Double = 4.0
     @State private var showResetConfirm = false
 
+    private let highTrafficThreshold: Double = 200_000
+
     var body: some View {
-        VStack(spacing: 10) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("LIVE")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                    Text(monitor.liveRate.formattedRate())
-                        .font(.system(.title2, design: .monospaced))
-                        .foregroundColor(monitor.liveRate > 200_000 ? .orange : .primary)
-                        .contentTransition(.numericText())
-                }
-
-                Spacer()
-
-                VStack(alignment: .trailing, spacing: 4) {
-                    Toggle(isOn: $travelModeOn) {
-                        Label("Travel Mode", systemImage: "airplane")
-                            .font(.caption)
-                    }
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                    .onChange(of: travelModeOn) { _, newValue in
-                        Task {
-                            if newValue {
-                                await TravelModeManager.shared.activate()
-                            } else {
-                                await TravelModeManager.shared.deactivate()
-                            }
-                        }
-                    }
-                }
-            }
-
-            HStack(spacing: 8) {
-                stat(title: "SESSION", value: monitor.sessionTotal.formattedBytes())
-                stat(title: "TODAY", value: monitor.todayTotal.formattedBytes())
-                stat(title: "WEEK", value: monitor.weekTotal.formattedBytes())
-                stat(title: "EST.", value: estimatedCost(monitor.sessionTotal))
-            }
-
-            HStack {
-                Spacer()
-                Button {
-                    showResetConfirm = true
-                } label: {
-                    Label("Reset Session", systemImage: "arrow.counterclockwise")
-                        .font(.caption2)
-                }
-                .controlSize(.mini)
-                .confirmationDialog(
-                    "Reset session counters?",
-                    isPresented: $showResetConfirm,
-                    titleVisibility: .visible
-                ) {
-                    Button("Reset", role: .destructive) {
-                        monitor.resetSession()
-                    }
-                    Button("Cancel", role: .cancel) {}
-                } message: {
-                    Text("This zeros the Session column and clears the per-host drilldowns. Daily/Week stays.")
-                }
-            }
+        VStack(alignment: .leading, spacing: Spacing.md) {
+            topRow
+            heroRate
+            statsRow
         }
-        .padding(12)
+        .padding(.horizontal, Spacing.lg)
+        .padding(.top, Spacing.lg)
+        .padding(.bottom, Spacing.md)
     }
 
-    private func stat(title: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title)
-                .font(.caption2)
-                .foregroundColor(.secondary)
-            Text(value)
-                .font(.system(.callout, design: .monospaced))
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
+    private var topRow: some View {
+        HStack(alignment: .center, spacing: Spacing.sm) {
+            HStack(spacing: 6) {
+                LivePulseDot(isActive: monitor.liveRate > 0)
+                Text("LIVE")
+                    .font(.netLabel)
+                    .foregroundStyle(.secondary)
+                    .tracking(0.8)
+            }
+            Spacer()
+            travelToggle
+            resetButton
+            settingsButton
+            quitButton
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(6)
-        .background(Color.gray.opacity(0.08))
-        .cornerRadius(6)
+    }
+
+    private var travelToggle: some View {
+        Button {
+            withAnimation(.netToggle) {
+                travelModeOn.toggle()
+            }
+            Task {
+                if travelModeOn {
+                    await TravelModeManager.shared.activate()
+                } else {
+                    await TravelModeManager.shared.deactivate()
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: travelModeOn ? "airplane.circle.fill" : "airplane")
+                    .font(.system(size: 11, weight: .semibold))
+                Text("Travel")
+                    .font(.system(size: 11, weight: .semibold))
+            }
+            .foregroundStyle(travelModeOn ? Color.white : Color.secondary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background {
+                Capsule()
+                    .fill(travelModeOn ? Color.accentColor : Palette.surfaceSubtle)
+            }
+            .overlay {
+                Capsule()
+                    .strokeBorder(travelModeOn ? Color.clear : Palette.divider, lineWidth: 0.5)
+            }
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(travelModeOn ? "Disable Travel Mode" : "Activate Travel Mode")
+    }
+
+    private var resetButton: some View {
+        circleIconButton(systemName: "arrow.counterclockwise", help: "Reset Session") {
+            showResetConfirm = true
+        }
+        .confirmationDialog(
+            "Reset session counters?",
+            isPresented: $showResetConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Reset", role: .destructive) {
+                monitor.resetSession()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This zeros the Session column and clears the per-host drilldowns. Daily/Week stays.")
+        }
+    }
+
+    private var settingsButton: some View {
+        circleIconButton(
+            systemName: "gearshape",
+            activeSystemName: "gearshape.fill",
+            isActive: inSettings,
+            help: inSettings ? "Close Settings" : "Open Settings"
+        ) {
+            withAnimation(.netContent) {
+                inSettings.toggle()
+            }
+        }
+    }
+
+    private var quitButton: some View {
+        circleIconButton(systemName: "power", help: "Quit NetWatch") {
+            NSApp.terminate(nil)
+        }
+    }
+
+    private func circleIconButton(
+        systemName: String,
+        activeSystemName: String? = nil,
+        isActive: Bool = false,
+        help: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: isActive ? (activeSystemName ?? systemName) : systemName)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(isActive ? Color.accentColor : Color.secondary)
+                .frame(width: 24, height: 24)
+                .background {
+                    Circle()
+                        .fill(isActive ? Color.accentColor.opacity(0.14) : Palette.surfaceSubtle)
+                }
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+
+    private var heroRate: some View {
+        let parts = splitRate(monitor.liveRate)
+        let isHigh = monitor.liveRate > highTrafficThreshold
+        return HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text(parts.value)
+                .font(.netHero)
+                .monospacedDigit()
+                .foregroundStyle(isHigh ? Palette.highTraffic : Color.primary)
+                .contentTransition(.numericText())
+                .animation(.snappy, value: parts.value)
+            Text(parts.unit)
+                .font(.netHeroUnit)
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 4)
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var statsRow: some View {
+        HStack(spacing: Spacing.sm) {
+            StatCard(
+                label: "SESSION",
+                value: monitor.sessionTotal.formattedBytes(),
+                isSelected: !inSettings && selectedPeriod == .session,
+                onTap: { onPeriodTap(.session) }
+            )
+            StatCard(
+                label: "TODAY",
+                value: monitor.todayTotal.formattedBytes(),
+                isSelected: !inSettings && selectedPeriod == .today,
+                onTap: { onPeriodTap(.today) }
+            )
+            StatCard(
+                label: "WEEK",
+                value: monitor.weekTotal.formattedBytes(),
+                isSelected: !inSettings && selectedPeriod == .week,
+                onTap: { onPeriodTap(.week) }
+            )
+            StatCard(
+                label: "EST.",
+                value: estimatedCost(monitor.sessionTotal),
+                accent: Palette.accent
+            )
+        }
+    }
+
+    private func splitRate(_ rate: Double) -> (value: String, unit: String) {
+        let formatted = rate.formattedRate()
+        if let lastSpace = formatted.lastIndex(of: " ") {
+            let value = String(formatted[..<lastSpace])
+            let unit = String(formatted[formatted.index(after: lastSpace)...])
+            return (value, unit)
+        }
+        return (formatted, "")
     }
 
     private func estimatedCost(_ bytes: Int64) -> String {

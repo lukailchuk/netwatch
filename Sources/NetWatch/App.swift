@@ -26,14 +26,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         monitor = TrafficMonitor.shared
         monitor.start()
 
-        statusItem = NSStatusBar.system.statusItem(withLength: 110)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
             button.action = #selector(togglePopover(_:))
             button.target = self
-            // Emoji is rendered as colored Unicode glyph — survives even if
-            // SF Symbol lookup fails or theme tinting strips the icon.
-            button.title = "🌐 0 B/s"
-            button.font = NSFont.menuBarFont(ofSize: 0)  // system default
+            if let icon = NSImage(systemSymbolName: "network", accessibilityDescription: "NetWatch") {
+                icon.isTemplate = true
+                button.image = icon
+                button.imagePosition = .imageLeading
+                button.imageHugsTitle = true
+            }
+            button.title = " 0 B/s"
+            button.font = NSFont.menuBarFont(ofSize: 0)
         }
 
         popover = NSPopover()
@@ -57,7 +61,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateMenubarTitle() {
         guard let button = statusItem.button else { return }
-        button.title = "🌐 \(monitor.liveRate.formattedRate())"
+        button.title = " \(monitor.liveRate.formattedRate())"
     }
 
     @objc private func togglePopover(_ sender: Any?) {

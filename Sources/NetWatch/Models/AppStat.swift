@@ -7,8 +7,21 @@ struct AppStat: Identifiable, Equatable, Hashable {
     let bytesIn: Int64
     let bytesOut: Int64
     let rate: Double  // bytes/sec, last sample
+    let pids: Set<Int32>  // live pids from current nettop sample (empty for DB-only history)
 
     var total: Int64 { bytesIn + bytesOut }
+    var isLive: Bool { !pids.isEmpty }
+
+    var formattedTotal: String {
+        ByteCountFormatter.string(fromByteCount: total, countStyle: .binary)
+    }
+}
+
+struct PeriodApp: Identifiable, Equatable, Hashable {
+    var id: String { bundleId }
+    let bundleId: String
+    let appName: String
+    let total: Int64
 
     var formattedTotal: String {
         ByteCountFormatter.string(fromByteCount: total, countStyle: .binary)

@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import Darwin
 
 enum AppControllerError: LocalizedError {
     case appNotRunning
@@ -17,6 +18,46 @@ enum AppControllerError: LocalizedError {
 
 @MainActor
 enum AppController {
+
+    /// Universal kill for any process(es) — works for GUI apps, helpers, daemons, CLI tools.
+    /// Strategy:
+    ///   1. If bundleId resolves to a GUI app → graceful NSRunningApplication.terminate() (lets app save state).
+    ///   2. SIGTERM all pids in parallel.
+    ///   3. Wait 3s, then SIGKILL anything still alive.
+    /// Permission denied (EPERM) for system daemons is logged, not thrown — kernel guards them.
+    static func killProcesses(pids: Set<Int32>, bundleId: String?) async {
+        // 1. Try graceful GUI shutdown first if applicable.
+        if let bundleId,
+           let guiApp = NSWorkspace.shared.runningApplications.first(where: {
+               $0.bundleIdentifier == bundleId
+           }) {
+            guiApp.terminate()
+        }
+
+        guard !pids.isEmpty else { return }
+
+        // 2. SIGTERM everyone.
+        for pid in pids {
+            if kill(pid, SIGTERM) != 0 {
+                let err = errno
+                if err != ESRCH {  // ESRCH = process already gone, not interesting
+                    print("[AppController] SIGTERM pid=\(pid) failed: errno=\(err) (\(String(cString: strerror(err))))")
+                }
+            }
+        }
+
+        try? await Task.sleep(nanoseconds: 3_000_000_000)
+
+        // 3. SIGKILL the survivors.
+        for pid in pids where kill(pid, 0) == 0 {
+            if kill(pid, SIGKILL) != 0 {
+                let err = errno
+                if err != ESRCH {
+                    print("[AppController] SIGKILL pid=\(pid) failed: errno=\(err) (\(String(cString: strerror(err))))")
+                }
+            }
+        }
+    }
 
     /// Quit a GUI app gracefully via NSRunningApplication.terminate().
     /// Falls back to forceTerminate after 3s if the app didn't honor the request.

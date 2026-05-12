@@ -2,66 +2,58 @@ import SwiftUI
 
 struct MenubarView: View {
     @EnvironmentObject var monitor: TrafficMonitor
-    @State private var selectedTab: Tab = .apps
-
-    enum Tab { case apps, charts, settings }
+    @State private var selectedPeriod: Period = .session
+    @State private var inSettings: Bool = false
 
     var body: some View {
         VStack(spacing: 0) {
-            HeaderView()
-                .environmentObject(monitor)
+            HeaderView(
+                selectedPeriod: $selectedPeriod,
+                inSettings: $inSettings,
+                onPeriodTap: handlePeriodTap
+            )
+            .environmentObject(monitor)
 
             Divider()
+                .opacity(0.4)
 
-            Group {
-                switch selectedTab {
-                case .apps:
-                    AppsGridView()
-                        .environmentObject(monitor)
-                case .charts:
-                    ChartsView()
-                        .environmentObject(monitor)
-                case .settings:
-                    SettingsView()
-                }
-            }
-
-            Divider()
-
-            HStack(spacing: 6) {
-                tabButton(.apps, label: "Apps", icon: "square.grid.2x2")
-                tabButton(.charts, label: "Charts", icon: "chart.bar")
-                tabButton(.settings, label: "Settings", icon: "gear")
-                Spacer()
-                Button {
-                    NSApp.terminate(nil)
-                } label: {
-                    Image(systemName: "power")
-                        .foregroundColor(.secondary)
-                }
-                .buttonStyle(.borderless)
-                .help("Quit NetWatch")
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
+            content
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(width: 400, height: 520)
+        .background {
+            VisualEffectBlur(material: .popover, blendingMode: .behindWindow)
+                .ignoresSafeArea()
+        }
     }
 
     @ViewBuilder
-    private func tabButton(_ tab: Tab, label: String, icon: String) -> some View {
-        Button {
-            selectedTab = tab
-        } label: {
-            HStack(spacing: 4) {
-                Image(systemName: icon)
-                Text(label).font(.caption)
+    private var content: some View {
+        Group {
+            if inSettings {
+                SettingsView()
+                    .transition(.opacity)
+            } else {
+                switch selectedPeriod {
+                case .session:
+                    AppsGridView()
+                        .environmentObject(monitor)
+                        .transition(.opacity)
+                case .today, .week:
+                    ChartsView(selectedPeriod: $selectedPeriod)
+                        .environmentObject(monitor)
+                        .transition(.opacity)
+                }
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(selectedTab == tab ? Color.accentColor.opacity(0.18) : Color.clear)
-            .cornerRadius(6)
         }
-        .buttonStyle(.borderless)
+        .animation(.netContent, value: inSettings)
+        .animation(.netContent, value: selectedPeriod)
+    }
+
+    private func handlePeriodTap(_ period: Period) {
+        withAnimation(.netContent) {
+            inSettings = false
+            selectedPeriod = period
+        }
     }
 }
