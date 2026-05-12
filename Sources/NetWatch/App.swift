@@ -23,6 +23,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
 
         _ = Database.shared
+
+        // If we restarted while apps were paused (force-quit, crash, or install.sh),
+        // scan the process table and rebuild paused state so the UI exposes Resume.
+        AppController.recoverPausedState()
+
         monitor = TrafficMonitor.shared
         monitor.start()
 

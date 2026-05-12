@@ -17,10 +17,6 @@ enum AppControllerError: LocalizedError {
     }
 }
 
-/// SSTOP constant from <sys/proc.h>. Swift's Darwin module doesn't re-export it,
-/// so we mirror the kernel value here. Stable since BSD; checked against macOS 14/15/26.
-private let kProcStatusStopped: UInt32 = 4
-
 @MainActor
 enum AppController {
 
@@ -33,14 +29,17 @@ enum AppController {
 
     // MARK: - Pause / Resume
 
-    /// Pause an app's full process tree via SIGSTOP.
+    /// Pause an app's full process tree via SIGSTOP, then float a "Paused" overlay
+    /// over its windows so the user sees explicit feedback (not a frozen window).
     /// Walks down through children (Browser Helper, GPU process, renderers...) so the whole app
     /// freezes — not just the network-talking pids. Otherwise main GUI stays reactive until the
-    /// first network call, then beachballs (confusing UX).
+    /// first network call, then beachballs.
     static func pause(bundleId: String, pids: Set<pid_t>) async {
+        log.info("[pause] entry bundle=\(bundleId, privacy: .public) input pids=\(pids.count, privacy: .public)")
         let tree = Self.processTree(rootPids: pids)
+        log.info("[pause] processTree size=\(tree.count, privacy: .public)")
         guard !tree.isEmpty else {
-            log.warning("pause(\(bundleId, privacy: .public)): empty pid tree, nothing to do")
+            log.warning("[pause] empty tree, nothing to do")
             return
         }
 
@@ -51,33 +50,82 @@ enum AppController {
             } else {
                 let err = errno
                 if err != ESRCH {
-                    log.error("SIGSTOP pid=\(pid, privacy: .public) failed: errno=\(err) (\(String(cString: strerror(err)), privacy: .public))")
+                    log.error("[pause] SIGSTOP pid=\(pid, privacy: .public) failed: errno=\(err)")
                 }
             }
         }
         pausedTracker[bundleId, default: []].formUnion(stopped)
-        log.info("paused \(bundleId, privacy: .public): \(stopped.count) pids")
+        log.info("[pause] SIGSTOP'd \(stopped.count, privacy: .public)/\(tree.count, privacy: .public) pids")
+
+        // SSoT mutation — UI re-renders within a frame.
+        TrafficMonitor.shared.setPaused(bundleId: bundleId, isPaused: true)
     }
 
     /// Resume an app's process tree via SIGCONT.
     /// Unions current tree with previously-tracked pids in case some children spawned/died between pause and resume.
     static func resume(bundleId: String, pids: Set<pid_t>) async {
+        log.info("[resume] entry bundle=\(bundleId, privacy: .public) input pids=\(pids.count, privacy: .public) tracked=\(pausedTracker[bundleId]?.count ?? 0, privacy: .public)")
+
         let tree = Self.processTree(rootPids: pids).union(pausedTracker[bundleId] ?? [])
+        log.info("[resume] tree size=\(tree.count, privacy: .public)")
+        var sentCount = 0
         for pid in tree {
-            if kill(pid, SIGCONT) != 0 {
+            if kill(pid, SIGCONT) == 0 {
+                sentCount += 1
+            } else {
                 let err = errno
                 if err != ESRCH {
-                    log.error("SIGCONT pid=\(pid, privacy: .public) failed: errno=\(err) (\(String(cString: strerror(err)), privacy: .public))")
+                    log.error("[resume] SIGCONT pid=\(pid, privacy: .public) failed: errno=\(err)")
                 }
             }
         }
         pausedTracker.removeValue(forKey: bundleId)
-        log.info("resumed \(bundleId, privacy: .public): \(tree.count) pids")
+        TrafficMonitor.shared.setPaused(bundleId: bundleId, isPaused: false)
+        log.info("[resume] DONE bundle=\(bundleId, privacy: .public) SIGCONT=\(sentCount, privacy: .public)/\(tree.count, privacy: .public)")
     }
 
     /// Whether a bundle is in user-intended paused state. UI uses this for toggle rendering.
     static func isPausedBundle(_ bundleId: String) -> Bool {
         pausedTracker.keys.contains(bundleId)
+    }
+
+    /// Snapshot of (bundleId → tracked pids). TrafficMonitor uses this to keep paused
+    /// apps visible in the UI even after they stop emitting nettop data — without it,
+    /// SIGSTOP-d apps disappear from the list and the user can't click Resume.
+    static func pausedBundlesSnapshot() -> [String: Set<pid_t>] {
+        pausedTracker
+    }
+
+    /// Crash recovery: NetWatch restarted (or was force-killed) while apps were paused.
+    /// Single sysctl(KERN_PROC_ALL) gives us pid + state + uid in one go — pick SSTOP'd
+    /// user-space GUI apps, resolve to bundleId via NSRunningApplication, rebuild tracker.
+    /// Without this, paused apps stay frozen but invisible to NetWatch.
+    static func recoverPausedState() {
+        let procs = Self.allProcesses()
+        guard !procs.isEmpty else { return }
+
+        var recovered: [String: Set<pid_t>] = [:]
+        for p in procs {
+            let pid = p.kp_proc.p_pid
+            guard pid > 0 else { continue }
+            // SSTOP only — every other state means "not paused by us".
+            guard Int(p.kp_proc.p_stat) == 4 else { continue }
+            // User processes only — system daemons aren't ours to manage.
+            guard p.kp_eproc.e_ucred.cr_uid >= 500 else { continue }
+
+            if let app = NSRunningApplication(processIdentifier: pid),
+               let bundleId = app.bundleIdentifier {
+                recovered[bundleId, default: []].insert(pid)
+            }
+        }
+
+        guard !recovered.isEmpty else { return }
+        for (bundleId, pids) in recovered {
+            pausedTracker[bundleId, default: []].formUnion(pids)
+            // Publish to UI immediately so recovered apps show up in Paused section.
+            TrafficMonitor.shared.setPaused(bundleId: bundleId, isPaused: true)
+        }
+        log.info("recovered \(recovered.count) paused bundles after restart")
     }
 
     /// Resume every process we ever paused. Called from `applicationWillTerminate` so the user
@@ -113,31 +161,28 @@ enum AppController {
         }
     }
 
-    // MARK: - Process introspection (libproc + sysctl)
+    // MARK: - Process introspection (sysctl(KERN_PROC))
 
-    /// BFS down the process tree from the given root pids. Apple's `proc_listpids` + per-pid
-    /// `proc_pidinfo(PROC_PIDTBSDINFO)` — same approach Activity Monitor uses internally.
+    // Why sysctl over proc_pidinfo: PROC_PIDTBSDINFO returns nil for system processes
+    // (UID < 500) without root, so isSystemProcess/isPaused gave false-negatives for
+    // trustd, mDNSResponder, etc. — exactly the processes we need to detect to *protect*.
+    // sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID) works for any pid without elevation.
+    // Same path ps(1), top(1), Activity Monitor use.
+
+    /// BFS down the process tree from the given root pids. One sysctl(KERN_PROC_ALL) call
+    /// returns parent pid for every process — so the entire tree resolves in a single syscall.
     nonisolated static func processTree(rootPids: Set<pid_t>) -> Set<pid_t> {
         guard !rootPids.isEmpty else { return [] }
+        let procs = Self.allProcesses()
+        guard !procs.isEmpty else { return rootPids }
 
-        let bytesNeeded = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
-        guard bytesNeeded > 0 else { return rootPids }
-
-        let pidCapacity = Int(bytesNeeded) / MemoryLayout<pid_t>.size
-        var allPids = [pid_t](repeating: 0, count: pidCapacity)
-        let actualBytes = proc_listpids(UInt32(PROC_ALL_PIDS), 0, &allPids, bytesNeeded)
-        guard actualBytes > 0 else { return rootPids }
-        let actualCount = Int(actualBytes) / MemoryLayout<pid_t>.size
-
-        // Build parent → children map in one pass. O(N) where N ~ 500 on a typical Mac.
         var children: [pid_t: [pid_t]] = [:]
-        for i in 0..<actualCount {
-            let pid = allPids[i]
-            guard pid > 0, let ppid = Self.parentPid(of: pid) else { continue }
-            children[ppid, default: []].append(pid)
+        for p in procs {
+            let pid = p.kp_proc.p_pid
+            guard pid > 0 else { continue }
+            children[p.kp_eproc.e_ppid, default: []].append(pid)
         }
 
-        // BFS from every root.
         var result = rootPids
         var queue = Array(rootPids)
         while !queue.isEmpty {
@@ -153,28 +198,51 @@ enum AppController {
     /// macOS UID convention: 0-99 system services, 200 _developer, 500+ regular users.
     /// We treat anything < 500 as system to prevent users from SIGSTOP'ing mDNSResponder etc.
     nonisolated static func isSystemProcess(pid: pid_t) -> Bool {
-        guard let info = Self.bsdInfo(of: pid) else { return false }
-        return info.pbi_uid < 500
+        guard let info = Self.kinfoProc(pid: pid) else { return false }
+        return info.kp_eproc.e_ucred.cr_uid < 500
     }
 
-    /// Reads `kp_proc.p_stat` via `proc_pidinfo`. Returns true iff the process is in SSTOP state.
-    /// Source of truth — kernel; we never trust an in-memory mirror.
+    /// Returns true iff process is in SSTOP state (4) — kernel SoT, not an in-memory mirror.
     nonisolated static func isPaused(pid: pid_t) -> Bool {
-        guard let info = Self.bsdInfo(of: pid) else { return false }
-        return info.pbi_status == kProcStatusStopped
+        guard let info = Self.kinfoProc(pid: pid) else { return false }
+        return Int(info.kp_proc.p_stat) == 4  // SSTOP from <sys/proc.h>
     }
 
-    nonisolated private static func parentPid(of pid: pid_t) -> pid_t? {
-        guard let info = Self.bsdInfo(of: pid) else { return nil }
-        return pid_t(info.pbi_ppid)
-    }
-
-    nonisolated private static func bsdInfo(of pid: pid_t) -> proc_bsdinfo? {
-        var info = proc_bsdinfo()
-        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
-        let result = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size)
-        guard result == size else { return nil }
+    /// Read `kinfo_proc` for a single pid. Works for any pid without root.
+    nonisolated private static func kinfoProc(pid: pid_t) -> kinfo_proc? {
+        var name: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        let nameCount = UInt32(name.count)
+        var size = MemoryLayout<kinfo_proc>.stride
+        var info = kinfo_proc()
+        let result = name.withUnsafeMutableBufferPointer { buf -> Int32 in
+            sysctl(buf.baseAddress, nameCount, &info, &size, nil, 0)
+        }
+        guard result == 0, size >= MemoryLayout<kinfo_proc>.stride else { return nil }
         return info
+    }
+
+    /// Read all processes via single sysctl(KERN_PROC_ALL) call. Two-step pattern:
+    /// first call to learn buffer size, second to fill. Standard BSD idiom.
+    nonisolated private static func allProcesses() -> [kinfo_proc] {
+        var name: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
+        let nameCount = UInt32(name.count)
+        var size: Int = 0
+        let r1 = name.withUnsafeMutableBufferPointer { buf -> Int32 in
+            sysctl(buf.baseAddress, nameCount, nil, &size, nil, 0)
+        }
+        guard r1 == 0, size > 0 else { return [] }
+
+        let stride = MemoryLayout<kinfo_proc>.stride
+        let capacity = (size / stride) + 16  // small headroom — process count can change between calls
+        var procs = [kinfo_proc](repeating: kinfo_proc(), count: capacity)
+        size = capacity * stride
+
+        let r2 = name.withUnsafeMutableBufferPointer { buf -> Int32 in
+            sysctl(buf.baseAddress, nameCount, &procs, &size, nil, 0)
+        }
+        guard r2 == 0 else { return [] }
+        let actualCount = size / stride
+        return Array(procs.prefix(actualCount))
     }
 
     // MARK: - Kill (existing, retained for × secondary action and TravelMode)

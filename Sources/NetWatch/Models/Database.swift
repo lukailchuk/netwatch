@@ -120,7 +120,6 @@ final class Database: @unchecked Sendable {
                     bytesOut: bytesOut,
                     rate: 0,         // injected later by TrafficMonitor.refreshAppsFromDB
                     pids: [],        // injected later by TrafficMonitor.refreshAppsFromDB
-                    isPaused: false, // injected later by TrafficMonitor.refreshAppsFromDB
                     isSystem: false  // injected later by TrafficMonitor.refreshAppsFromDB
                 ))
             }

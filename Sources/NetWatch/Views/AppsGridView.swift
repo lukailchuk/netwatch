@@ -1,5 +1,8 @@
 import SwiftUI
 import AppKit
+import os
+
+private let uiLog = Logger(subsystem: "io.netwatch", category: "ui")
 
 struct AppsGridView: View {
     @EnvironmentObject var monitor: TrafficMonitor
@@ -13,24 +16,25 @@ struct AppsGridView: View {
                     emptyState
                         .padding(.top, Spacing.xxxl)
                 } else {
-                    ForEach(monitor.apps.prefix(25)) { app in
-                        VStack(spacing: 0) {
-                            AppRow(
-                                app: app,
-                                isProcessing: processingId == app.id,
-                                isExpanded: expandedBundleIds.contains(app.bundleId),
-                                onAction: { action in handle(action: action, for: app) },
-                                onToggleExpand: { toggleExpand(app.bundleId) }
-                            )
+                    // SAME Set used for filter AND for AppRow's isPaused param —
+                    // filter and render can't disagree, race impossible.
+                    let pausedSet = monitor.pausedBundles
+                    let paused = monitor.apps.filter { pausedSet.contains($0.bundleId) }
+                    let active = monitor.apps.filter { !pausedSet.contains($0.bundleId) }
 
-                            if expandedBundleIds.contains(app.bundleId) {
-                                ConnectionsListView(bundleId: app.bundleId)
-                                    .environmentObject(monitor)
-                                    .transition(.asymmetric(
-                                        insertion: .opacity.combined(with: .move(edge: .top)),
-                                        removal: .opacity
-                                    ))
-                            }
+                    if !paused.isEmpty {
+                        sectionHeader(title: "Paused", count: paused.count, accent: Palette.warning)
+                        ForEach(paused) { app in
+                            rowEntry(app: app)
+                        }
+                    }
+
+                    if !active.isEmpty {
+                        if !paused.isEmpty {
+                            sectionHeader(title: "Active", count: nil, accent: nil)
+                        }
+                        ForEach(active.prefix(25)) { app in
+                            rowEntry(app: app)
                         }
                     }
                 }
@@ -38,6 +42,45 @@ struct AppsGridView: View {
             .padding(.horizontal, Spacing.md)
             .padding(.vertical, Spacing.sm)
         }
+    }
+
+    @ViewBuilder
+    private func rowEntry(app: AppStat) -> some View {
+        VStack(spacing: 0) {
+            AppRow(
+                app: app,
+                isProcessing: processingId == app.id,
+                isExpanded: expandedBundleIds.contains(app.bundleId),
+                onAction: { action in handle(action: action, for: app) },
+                onToggleExpand: { toggleExpand(app.bundleId) }
+            )
+
+            if expandedBundleIds.contains(app.bundleId) {
+                ConnectionsListView(bundleId: app.bundleId)
+                    .environmentObject(monitor)
+                    .transition(.asymmetric(
+                        insertion: .opacity.combined(with: .move(edge: .top)),
+                        removal: .opacity
+                    ))
+            }
+        }
+    }
+
+    private func sectionHeader(title: String, count: Int?, accent: Color?) -> some View {
+        HStack(spacing: 6) {
+            Text(title.uppercased())
+                .font(.netLabel)
+                .foregroundStyle(.tertiary)
+            if let count {
+                Text("\(count)")
+                    .font(.netLabel)
+                    .foregroundStyle(accent ?? Color.secondary.opacity(0.6))
+            }
+            Spacer()
+        }
+        .padding(.horizontal, Spacing.md)
+        .padding(.top, Spacing.sm)
+        .padding(.bottom, 2)
     }
 
     private var emptyState: some View {
@@ -77,6 +120,7 @@ struct AppsGridView: View {
     }
 
     private func handle(action: AppRowAction, for app: AppStat) {
+        uiLog.info("[click] action=\(String(describing: action), privacy: .public) bundle=\(app.bundleId, privacy: .public) pids=\(app.pids.count, privacy: .public) currentlyPaused=\(self.monitor.pausedBundles.contains(app.bundleId), privacy: .public)")
         Task { @MainActor in
             processingId = app.id
             defer { processingId = nil }
@@ -89,6 +133,8 @@ struct AppsGridView: View {
             case .kill:
                 await AppController.killProcesses(pids: app.pids, bundleId: app.bundleId)
             }
+            uiLog.info("[click] action done bundle=\(app.bundleId, privacy: .public) pausedBundles size=\(self.monitor.pausedBundles.count, privacy: .public)")
+            monitor.tickNow()
         }
     }
 }
@@ -106,10 +152,13 @@ struct AppRow: View {
     let onAction: (AppRowAction) -> Void
     let onToggleExpand: () -> Void
 
+    // Read paused state LIVE from monitor — never trust a captured init prop because
+    // SwiftUI ForEach can reuse this view across sections (paused/active) and pass stale value.
+    @EnvironmentObject var monitor: TrafficMonitor
+    private var isPaused: Bool { monitor.pausedBundles.contains(app.bundleId) }
+
     @State private var icon: NSImage?
     @State private var isHovered: Bool = false
-    @State private var showPauseInfo: Bool = false
-    @AppStorage("netwatch.firstPauseShown") private var firstPauseShown: Bool = false
 
     private let rateNoiseFloor: Double = 100
 
@@ -159,22 +208,26 @@ struct AppRow: View {
 
     @ViewBuilder
     private var iconView: some View {
-        if let icon {
-            Image(nsImage: icon)
-                .resizable()
-                .interpolation(.high)
-                .frame(width: 30, height: 30)
-                .shadow(color: .black.opacity(0.08), radius: 1, x: 0, y: 0.5)
-        } else {
-            RoundedRectangle(cornerRadius: Radius.sm, style: .continuous)
-                .fill(Color.secondary.opacity(0.2))
-                .frame(width: 30, height: 30)
-                .overlay {
-                    Image(systemName: "app.dashed")
-                        .font(.system(size: 14))
-                        .foregroundStyle(.secondary)
-                }
+        Group {
+            if let icon {
+                Image(nsImage: icon)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 30, height: 30)
+                    .shadow(color: .black.opacity(0.08), radius: 1, x: 0, y: 0.5)
+            } else {
+                RoundedRectangle(cornerRadius: Radius.sm, style: .continuous)
+                    .fill(Color.secondary.opacity(0.2))
+                    .frame(width: 30, height: 30)
+                    .overlay {
+                        Image(systemName: "app.dashed")
+                            .font(.system(size: 14))
+                            .foregroundStyle(.secondary)
+                    }
+            }
         }
+        .opacity(isPaused ? 0.45 : 1.0)
+        .grayscale(isPaused ? 0.6 : 0)
     }
 
     private var nameBlock: some View {
@@ -191,27 +244,40 @@ struct AppRow: View {
         }
     }
 
+    @ViewBuilder
     private var rateBlock: some View {
-        VStack(alignment: .trailing, spacing: 2) {
-            if !rateText.isEmpty {
-                HStack(spacing: 4) {
-                    Circle()
-                        .fill(Palette.liveDot)
-                        .frame(width: 5, height: 5)
-                    Text(rateText)
-                        .font(.netMono)
-                        .foregroundStyle(Palette.highTraffic)
-                        .monospacedDigit()
-                }
-                .transition(.opacity.combined(with: .move(edge: .trailing)))
+        if isPaused {
+            HStack(spacing: 4) {
+                Image(systemName: "pause.circle.fill")
+                    .font(.caption2)
+                    .foregroundStyle(Palette.warning)
+                Text("Paused")
+                    .font(.netMono)
+                    .foregroundStyle(Palette.warning)
             }
-            Text(app.formattedTotal)
-                .font(.netMonoSm)
-                .foregroundStyle(.secondary)
-                .monospacedDigit()
+            .frame(minWidth: 84, alignment: .trailing)
+        } else {
+            VStack(alignment: .trailing, spacing: 2) {
+                if !rateText.isEmpty {
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(Palette.liveDot)
+                            .frame(width: 5, height: 5)
+                        Text(rateText)
+                            .font(.netMono)
+                            .foregroundStyle(Palette.highTraffic)
+                            .monospacedDigit()
+                    }
+                    .transition(.opacity.combined(with: .move(edge: .trailing)))
+                }
+                Text(app.formattedTotal)
+                    .font(.netMonoSm)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            .frame(minWidth: 84, alignment: .trailing)
+            .animation(.netContent, value: rateText.isEmpty)
         }
-        .frame(minWidth: 84, alignment: .trailing)
-        .animation(.netContent, value: rateText.isEmpty)
     }
 
     @ViewBuilder
@@ -240,27 +306,20 @@ struct AppRow: View {
 
     private var pauseToggle: some View {
         Button {
-            if !app.isPaused && !firstPauseShown {
-                showPauseInfo = true
-                firstPauseShown = true
-            }
-            onAction(app.isPaused ? .resume : .pause)
+            onAction(isPaused ? .resume : .pause)
         } label: {
-            Image(systemName: app.isPaused ? "pause.circle.fill" : "power.circle.fill")
+            Image(systemName: isPaused ? "play.circle.fill" : "pause.circle.fill")
                 .font(.system(size: 22, weight: .medium))
                 .foregroundStyle(
-                    app.isPaused ? Palette.warning : Palette.danger,
-                    (app.isPaused ? Palette.warning : Palette.danger).opacity(0.15)
+                    isPaused ? Palette.success : Palette.warning,
+                    (isPaused ? Palette.success : Palette.warning).opacity(0.15)
                 )
                 .symbolRenderingMode(.palette)
                 .frame(width: 26, height: 26)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(app.isPaused ? "Resume \(app.appName)" : "Pause \(app.appName) (freezes the whole process)")
-        .popover(isPresented: $showPauseInfo, arrowEdge: .trailing) {
-            pauseInfoPopover
-        }
+        .help(isPaused ? "Resume \(app.appName)" : "Pause \(app.appName) (overlays a Paused screen)")
     }
 
     private var killSecondary: some View {
@@ -290,29 +349,4 @@ struct AppRow: View {
             .help(help)
     }
 
-    private var pauseInfoPopover: some View {
-        VStack(alignment: .leading, spacing: Spacing.sm) {
-            HStack(spacing: 6) {
-                Image(systemName: "info.circle.fill")
-                    .foregroundStyle(Palette.warning)
-                Text("Heads up — это pause, не firewall")
-                    .font(.headline)
-            }
-            Text("Pause freezes the **whole process** (UI included), not just network. The app's window will become unresponsive until you resume.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Text("True per-process firewalling needs a Network Extension — planned for a future version.")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
-            HStack {
-                Spacer()
-                Button("Got it") { showPauseInfo = false }
-                    .keyboardShortcut(.defaultAction)
-            }
-        }
-        .padding(Spacing.md)
-        .frame(width: 320)
-    }
 }
