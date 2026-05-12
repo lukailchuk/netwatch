@@ -199,17 +199,14 @@ struct ChartsView: View {
 
     private var appBreakdownSection: some View {
         VStack(alignment: .leading, spacing: Spacing.md) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(selectedPeriod.breakdownTitle)
-                    .font(.netSectionHeader)
-                    .foregroundStyle(.primary)
-                Spacer()
-                if !periodApps.isEmpty {
+            SectionHeader(
+                title: selectedPeriod.breakdownTitle,
+                accessory: periodApps.isEmpty ? nil : AnyView(
                     Text("\(periodApps.count) apps")
                         .font(.netMonoSm)
                         .foregroundStyle(.tertiary)
-                }
-            }
+                )
+            )
 
             if periodApps.isEmpty {
                 placeholderCard(icon: "tray", message: selectedPeriod.emptyMessage)
@@ -273,7 +270,7 @@ private struct AppBreakdownRow: View {
                     .foregroundStyle(.primary)
                     .lineLimit(1)
                 Spacer(minLength: Spacing.sm)
-                Text(app.formattedTotal)
+                Text(app.total.formattedBytes())
                     .font(.netMonoSm)
                     .monospacedDigit()
                     .foregroundStyle(.secondary)

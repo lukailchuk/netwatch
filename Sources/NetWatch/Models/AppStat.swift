@@ -12,10 +12,6 @@ struct AppStat: Identifiable, Equatable, Hashable {
 
     var total: Int64 { bytesIn + bytesOut }
     var isLive: Bool { !pids.isEmpty }
-
-    var formattedTotal: String {
-        ByteCountFormatter.string(fromByteCount: total, countStyle: .binary)
-    }
 }
 
 struct PeriodApp: Identifiable, Equatable, Hashable {
@@ -23,10 +19,6 @@ struct PeriodApp: Identifiable, Equatable, Hashable {
     let bundleId: String
     let appName: String
     let total: Int64
-
-    var formattedTotal: String {
-        ByteCountFormatter.string(fromByteCount: total, countStyle: .binary)
-    }
 }
 
 struct ConnectionStat: Identifiable, Equatable, Hashable {

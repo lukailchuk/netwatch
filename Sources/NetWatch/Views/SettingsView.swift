@@ -159,9 +159,7 @@ struct SettingsSection<Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.sm) {
-            Text(title)
-                .font(.netSectionHeader)
-                .foregroundStyle(.primary)
+            SectionHeader(title: title)
                 .padding(.horizontal, 2)
 
             VStack(alignment: .leading, spacing: Spacing.sm) {

@@ -263,7 +263,7 @@ struct AppRow: View {
                     }
                     .transition(.opacity.combined(with: .move(edge: .trailing)))
                 }
-                Text(app.formattedTotal)
+                Text(app.total.formattedBytes())
                     .font(.netMonoSm)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
