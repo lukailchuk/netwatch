@@ -2,13 +2,15 @@ import SwiftUI
 
 struct HeaderView: View {
     @EnvironmentObject var monitor: TrafficMonitor
+    @ObservedObject var travelManager = TravelModeManager.shared
     @Binding var selectedPeriod: Period
     @Binding var inSettings: Bool
     let onPeriodTap: (Period) -> Void
 
-    @AppStorage("travelModeActive") private var travelModeOn: Bool = false
     @AppStorage("costPerGB") private var costPerGB: Double = 4.0
+    @AppStorage("netwatch.hasSeenTravelPreview") private var hasSeenTravelPreview: Bool = false
     @State private var showResetConfirm = false
+    @State private var showTravelPreview = false
 
     private let highTrafficThreshold: Double = 200_000
 
@@ -21,6 +23,17 @@ struct HeaderView: View {
         .padding(.horizontal, Spacing.lg)
         .padding(.top, Spacing.lg)
         .padding(.bottom, Spacing.md)
+        .sheet(isPresented: $showTravelPreview) {
+            TravelModePreviewSheet(
+                candidates: travelManager.previewCandidates(),
+                onConfirm: {
+                    hasSeenTravelPreview = true
+                    showTravelPreview = false
+                    Task { await travelManager.activate() }
+                },
+                onCancel: { showTravelPreview = false }
+            )
+        }
     }
 
     private var topRow: some View {
@@ -33,6 +46,9 @@ struct HeaderView: View {
                     .tracking(0.8)
             }
             Spacer()
+            if travelManager.isActive {
+                panicButton
+            }
             travelToggle
             resetButton
             settingsButton
@@ -43,37 +59,61 @@ struct HeaderView: View {
     private var travelToggle: some View {
         Button {
             withAnimation(.netToggle) {
-                travelModeOn.toggle()
-            }
-            Task {
-                if travelModeOn {
-                    await TravelModeManager.shared.activate()
+                if travelManager.isActive {
+                    Task { await travelManager.deactivate() }
+                } else if hasSeenTravelPreview {
+                    Task { await travelManager.activate() }
                 } else {
-                    await TravelModeManager.shared.deactivate()
+                    showTravelPreview = true
                 }
             }
         } label: {
             HStack(spacing: 5) {
-                Image(systemName: travelModeOn ? "airplane.circle.fill" : "airplane")
+                Image(systemName: travelManager.isActive ? "airplane.circle.fill" : "airplane")
                     .font(.system(size: 11, weight: .semibold))
                 Text("Travel")
                     .font(.system(size: 11, weight: .semibold))
             }
-            .foregroundStyle(travelModeOn ? Color.white : Color.secondary)
+            .foregroundStyle(travelManager.isActive ? Color.white : Color.secondary)
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
             .background {
                 Capsule()
-                    .fill(travelModeOn ? Color.accentColor : Palette.surfaceSubtle)
+                    .fill(travelManager.isActive ? Color.accentColor : Palette.surfaceSubtle)
             }
             .overlay {
                 Capsule()
-                    .strokeBorder(travelModeOn ? Color.clear : Palette.divider, lineWidth: 0.5)
+                    .strokeBorder(travelManager.isActive ? Color.clear : Palette.divider, lineWidth: 0.5)
             }
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .help(travelModeOn ? "Disable Travel Mode" : "Activate Travel Mode")
+        .help(travelManager.isActive ? "Disable Travel Mode" : "Activate Travel Mode")
+    }
+
+    /// Emergency release. Visible only while Travel Mode is on. One click → SIGCONT all
+    /// session-paused bundles + deactivate. Recovery path if something user needed got caught.
+    private var panicButton: some View {
+        Button {
+            Task { await travelManager.panicResume() }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10, weight: .bold))
+                Text("Resume all")
+                    .font(.system(size: 10, weight: .bold))
+            }
+            .foregroundStyle(Color.white)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background {
+                Capsule()
+                    .fill(Palette.danger)
+            }
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help("PANIC: resume every app Travel Mode paused and turn it off")
     }
 
     private var resetButton: some View {

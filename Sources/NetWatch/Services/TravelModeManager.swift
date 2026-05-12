@@ -1,85 +1,177 @@
 import Foundation
 import AppKit
+import Combine
 import os
 
+/// Default-deny Travel Mode. When active, every non-whitelisted user-space app is SIGSTOP'd.
+/// Deactivate resumes only what THIS session paused — manual pauses from the grid stay paused.
 @MainActor
-final class TravelModeManager {
+final class TravelModeManager: ObservableObject {
     static let shared = TravelModeManager()
-    private init() {}
 
     private let log = Logger(subsystem: "io.netwatch", category: "travel-mode")
 
-    /// UserDefaults key holding `[String]` of bundle IDs that were ACTUALLY running
-    /// when the user activated Travel Mode. Only these get re-launched on deactivate —
-    /// apps that were already closed pre-activation stay closed. Without this snapshot,
-    /// toggling off would launch every app in the preset list, even ones the user
-    /// hasn't opened in months (Steam, Discord, OneDrive). Bug-fix v1.0.1.
-    private let snapshotKey = "netwatch.travelModeSnapshot"
+    @Published private(set) var isActive: Bool = false
+
+    /// Bundle IDs that THIS activation paused. Source of truth for what deactivate should resume.
+    /// Excludes anything already paused before activation (manual user pauses stay manual).
+    private var sessionPausedBundles: Set<String> = []
+
+    /// Apps the user explicitly launched during Travel Mode → auto-allowed for this session.
+    /// Not persisted — clears on deactivate. User intent: "I just opened it, I want it."
+    private var sessionWhitelist: Set<String> = []
+
+    /// NSWorkspace observer token, kept so we can unsubscribe on deactivate.
+    private var launchObserver: NSObjectProtocol?
+
+    private init() {}
+
+    // MARK: - Lifecycle
 
     func activate() async {
-        let targets = TravelModeStore.load().filter { $0.enabled }
-        log.info("activating, \(targets.count) enabled targets")
+        let whitelist = effectiveWhitelist()
+        log.info("activate: whitelist size \(whitelist.count)")
 
-        // 1. Snapshot pre-activation running state — source of truth for deactivate.
-        var snapshot: [String] = []
-        for target in targets {
-            if let bid = target.bundleId, AppController.isAppRunning(bundleId: bid) {
-                snapshot.append(bid)
-            }
+        let monitor = TrafficMonitor.shared
+        var paused: Set<String> = []
+
+        for app in monitor.apps {
+            // System procs: SIGSTOP doesn't work (UID < 500). Show them but don't touch.
+            if app.isSystem { continue }
+            // No live pids = nothing to pause (DB-only history row).
+            if app.pids.isEmpty { continue }
+            // Already paused (manual) — leave alone, not our jurisdiction.
+            if AppController.isPausedBundle(app.bundleId) { continue }
+            // Whitelisted explicitly or via parent inheritance.
+            if TravelWhitelistStore.isAllowed(app.bundleId, in: whitelist) { continue }
+
+            await AppController.pause(bundleId: app.bundleId, pids: app.pids)
+            paused.insert(app.bundleId)
         }
-        UserDefaults.standard.set(snapshot, forKey: snapshotKey)
-        log.info("snapshot: \(snapshot.count) running app(s) to restore later")
 
-        // 2. Quit only apps that ARE in snapshot (others already closed — skip).
-        for target in targets {
-            if let bid = target.bundleId, snapshot.contains(bid) {
-                try? await AppController.quitApp(bundleId: bid)
-                log.info("quit \(target.displayName, privacy: .public)")
-            }
+        sessionPausedBundles = paused
+        isActive = true
+        startLaunchObserver()
+        log.info("activate done: paused \(paused.count) bundles")
+    }
 
-            // launchd agents are a separate concern from GUI apps. We bootout
-            // those that are currently loaded; on next login they'll auto-start
-            // again per their launchd plist. Snapshot doesn't track them yet.
-            if let label = target.launchdLabel, AppController.isLaunchAgentLoaded(label: label) {
-                let result = AppController.disableUserLaunchAgent(label: label)
-                switch result {
-                case .success:
-                    log.info("disabled launchd: \(label, privacy: .public)")
-                case .failure(let err):
-                    log.error("could not disable \(label, privacy: .public): \(err.localizedDescription, privacy: .public) — likely a system daemon (needs admin)")
-                }
+    func deactivate() async {
+        log.info("deactivate: resuming \(self.sessionPausedBundles.count) bundles")
+        stopLaunchObserver()
+
+        let snapshot = AppController.pausedBundlesSnapshot()
+        for bundleId in sessionPausedBundles {
+            let pids = snapshot[bundleId] ?? []
+            await AppController.resume(bundleId: bundleId, pids: pids)
+        }
+
+        sessionPausedBundles.removeAll()
+        sessionWhitelist.removeAll()
+        isActive = false
+    }
+
+    /// Emergency button. Same as deactivate but distinct for telemetry/logging context.
+    func panicResume() async {
+        log.warning("PANIC: resuming all \(self.sessionPausedBundles.count) bundles")
+        await deactivate()
+    }
+
+    // MARK: - Whitelist mutations (called from Settings UI)
+
+    /// Persist whitelist entry. If currently paused by THIS session, resume immediately.
+    func allow(bundleId: String) async {
+        TravelWhitelistStore.allow(bundleId)
+
+        guard isActive, sessionPausedBundles.contains(bundleId) else { return }
+        let pids = AppController.pausedBundlesSnapshot()[bundleId] ?? []
+        await AppController.resume(bundleId: bundleId, pids: pids)
+        sessionPausedBundles.remove(bundleId)
+        TrafficMonitor.shared.tickNow()
+    }
+
+    /// Remove from whitelist. If Travel Mode active and bundle currently running, pause it.
+    func disallow(bundleId: String) async {
+        TravelWhitelistStore.disallow(bundleId)
+
+        guard isActive else { return }
+        guard let app = TrafficMonitor.shared.apps.first(where: { $0.bundleId == bundleId }) else { return }
+        guard !app.isSystem, !app.pids.isEmpty else { return }
+        guard !AppController.isPausedBundle(bundleId) else { return }  // already paused
+
+        await AppController.pause(bundleId: bundleId, pids: app.pids)
+        sessionPausedBundles.insert(bundleId)
+        TrafficMonitor.shared.tickNow()
+    }
+
+    // MARK: - Reconciliation (called each sample tick)
+
+    /// Auto-pause new processes that appeared since last sample. Default-deny consistency:
+    /// no fresh traffic can sneak through while Travel Mode is on.
+    func reconcile(currentApps: [AppStat]) async {
+        guard isActive else { return }
+        let whitelist = effectiveWhitelist()
+
+        for app in currentApps {
+            // Re-check between awaits — PANIC button or deactivate may have flipped state
+            // while we suspended on the previous `await pause`. Without this we keep pausing
+            // after the user already hit Resume all.
+            guard isActive else { return }
+            if app.isSystem || app.pids.isEmpty { continue }
+            if sessionPausedBundles.contains(app.bundleId) { continue }
+            if AppController.isPausedBundle(app.bundleId) { continue }
+            if TravelWhitelistStore.isAllowed(app.bundleId, in: whitelist) { continue }
+
+            await AppController.pause(bundleId: app.bundleId, pids: app.pids)
+            sessionPausedBundles.insert(app.bundleId)
+            log.info("reconcile: paused new bundle \(app.bundleId, privacy: .public)")
+        }
+    }
+
+    // MARK: - Preview (first-run UX)
+
+    /// Apps that would be paused if user toggled Travel Mode on right now.
+    /// Used by the first-run preview sheet.
+    func previewCandidates() -> [AppStat] {
+        let whitelist = effectiveWhitelist()
+        return TrafficMonitor.shared.apps.filter { app in
+            !app.isSystem
+                && !app.pids.isEmpty
+                && !AppController.isPausedBundle(app.bundleId)
+                && !TravelWhitelistStore.isAllowed(app.bundleId, in: whitelist)
+        }
+    }
+
+    // MARK: - Helpers
+
+    /// User whitelist ∪ activation-time baseline ∪ session auto-launches.
+    private func effectiveWhitelist() -> Set<String> {
+        TravelWhitelistStore.load()
+            .union(TravelBaseline.compute())
+            .union(sessionWhitelist)
+    }
+
+    private func startLaunchObserver() {
+        guard launchObserver == nil else { return }
+        launchObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didLaunchApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  let bid = app.bundleIdentifier else { return }
+            Task { @MainActor in
+                guard let self else { return }
+                guard self.isActive else { return }
+                self.sessionWhitelist.insert(bid)
+                self.log.info("session auto-allow: \(bid, privacy: .public) (user launched)")
             }
         }
     }
 
-    func deactivate() async {
-        let snapshot = UserDefaults.standard.stringArray(forKey: snapshotKey) ?? []
-        log.info("deactivating, snapshot has \(snapshot.count) app(s)")
-
-        guard !snapshot.isEmpty else {
-            log.info("empty snapshot — nothing to restore")
-            return
+    private func stopLaunchObserver() {
+        if let observer = launchObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+            launchObserver = nil
         }
-
-        // Build a bundleId → appPath lookup from preset (preset config is authoritative
-        // for "where on disk this app lives"; snapshot tells us "which ones to start").
-        var pathByBundle: [String: String] = [:]
-        for t in TravelModeStore.load() {
-            if let bid = t.bundleId, let path = t.appPath {
-                pathByBundle[bid] = path
-            }
-        }
-
-        for bid in snapshot {
-            guard let path = pathByBundle[bid],
-                  FileManager.default.fileExists(atPath: path),
-                  !AppController.isAppRunning(bundleId: bid)
-            else { continue }
-            AppController.launchApp(at: path)
-            log.info("re-launched \(bid, privacy: .public)")
-        }
-
-        UserDefaults.standard.removeObject(forKey: snapshotKey)
-        log.info("snapshot cleared")
     }
 }

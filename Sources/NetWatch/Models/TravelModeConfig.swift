@@ -1,85 +1,117 @@
 import Foundation
+import AppKit
 
-struct TravelTarget: Codable, Identifiable {
-    let id: UUID
-    var displayName: String
-    var bundleId: String?       // for GUI apps (NSWorkspace.runningApplications match)
-    var launchdLabel: String?   // for daemons (com.apple.bird, com.apple.backupd-auto, ...)
-    var appPath: String?        // for re-launch via `open -a`
-    var enabled: Bool
+/// Default-deny whitelist. Stores bundle_id (or raw exec name) of apps allowed to
+/// run during Travel Mode. Helper sub-processes inherit via prefix match —
+/// allow `com.google.Chrome` ⇒ `com.google.Chrome.helper.Renderer` auto-allowed.
+enum TravelWhitelistStore {
+    private static let key = "netwatch.travelWhitelist.v2"
 
-    init(
-        id: UUID = UUID(),
-        displayName: String,
-        bundleId: String? = nil,
-        launchdLabel: String? = nil,
-        appPath: String? = nil,
-        enabled: Bool = true
-    ) {
-        self.id = id
-        self.displayName = displayName
-        self.bundleId = bundleId
-        self.launchdLabel = launchdLabel
-        self.appPath = appPath
-        self.enabled = enabled
+    static func load() -> Set<String> {
+        if let arr = UserDefaults.standard.array(forKey: key) as? [String] {
+            return Set(arr)
+        }
+        return []
+    }
+
+    static func save(_ set: Set<String>) {
+        UserDefaults.standard.set(Array(set), forKey: key)
+    }
+
+    /// Add a key (bundle id or exec name). Returns updated set.
+    @discardableResult
+    static func allow(_ key: String) -> Set<String> {
+        var s = load()
+        s.insert(key)
+        save(s)
+        return s
+    }
+
+    /// Remove a key. Returns updated set.
+    @discardableResult
+    static func disallow(_ key: String) -> Set<String> {
+        var s = load()
+        s.remove(key)
+        save(s)
+        return s
+    }
+
+    /// True if `bundleId` is explicitly whitelisted OR any whitelist entry is its parent.
+    /// `com.google.Chrome` in whitelist ⇒ `com.google.Chrome.helper.Renderer` allowed.
+    static func isAllowed(_ bundleId: String, in whitelist: Set<String>) -> Bool {
+        if whitelist.contains(bundleId) { return true }
+        for entry in whitelist where bundleId.hasPrefix(entry + ".") {
+            return true
+        }
+        return false
     }
 }
 
-enum TravelModeStore {
-    private static let key = "netwatch.travelTargets"
-
-    static func load() -> [TravelTarget] {
-        if let data = UserDefaults.standard.data(forKey: key),
-           let decoded = try? JSONDecoder().decode([TravelTarget].self, from: data),
-           !decoded.isEmpty {
-            return decoded
+/// Auto-baseline applied at every activation. NetWatch itself + frontmost app + active terminal
+/// always run, no matter what user did with the whitelist. Prevents the worst case: pausing
+/// the UI you're using to manage pause state.
+enum TravelBaseline {
+    /// Bundle IDs that are ALWAYS allowed during Travel Mode (in addition to user whitelist).
+    /// Computed at activation time (frontmost can change). Not persisted.
+    @MainActor
+    static func compute() -> Set<String> {
+        var s: Set<String> = []
+        // NetWatch itself — without this we pause our own UI and can't recover.
+        if let me = Bundle.main.bundleIdentifier { s.insert(me) }
+        // Whoever's in focus when user hit the button — current work, don't break it.
+        if let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier {
+            s.insert(front)
         }
-        save(defaultTargets)
-        return defaultTargets
-    }
-
-    static func save(_ targets: [TravelTarget]) {
-        if let data = try? JSONEncoder().encode(targets) {
-            UserDefaults.standard.set(data, forKey: key)
+        // Active terminal — likely running build/dev workflow.
+        for app in NSWorkspace.shared.runningApplications {
+            guard let bid = app.bundleIdentifier else { continue }
+            if bid == "com.apple.Terminal" || bid == "com.googlecode.iterm2" || bid == "dev.warp.Warp-Stable" {
+                s.insert(bid)
+            }
         }
+        return s
     }
-
-    static let defaultTargets: [TravelTarget] = [
-        // GUI apps — quit via AppleScript / NSRunningApplication.terminate()
-        .init(displayName: "Dropbox",
-              bundleId: "com.getdropbox.dropbox",
-              appPath: "/Applications/Dropbox.app"),
-        .init(displayName: "Google Drive",
-              bundleId: "com.google.drivefs",
-              appPath: "/Applications/Google Drive.app"),
-        .init(displayName: "OneDrive",
-              bundleId: "com.microsoft.OneDrive",
-              appPath: "/Applications/OneDrive.app"),
-        .init(displayName: "Spotify",
-              bundleId: "com.spotify.client",
-              appPath: "/Applications/Spotify.app"),
-        .init(displayName: "Slack",
-              bundleId: "com.tinyspeck.slackmacgap",
-              appPath: "/Applications/Slack.app"),
-        .init(displayName: "Telegram",
-              bundleId: "ru.keepcoder.Telegram",
-              appPath: "/Applications/Telegram.app"),
-        .init(displayName: "Discord",
-              bundleId: "com.hnc.Discord",
-              appPath: "/Applications/Discord.app"),
-        .init(displayName: "Steam",
-              bundleId: "com.valvesoftware.steam",
-              appPath: "/Applications/Steam.app"),
-        // launchd-managed daemons — bootout requires admin password (one-time per session)
-        .init(displayName: "iCloud Drive (bird)",
-              launchdLabel: "com.apple.bird"),
-        .init(displayName: "Photo Library sync",
-              launchdLabel: "com.apple.cloudphotod"),
-        .init(displayName: "Time Machine auto-backup",
-              launchdLabel: "com.apple.backupd-auto"),
-        .init(displayName: "Adobe Updater",
-              launchdLabel: "com.adobe.AdobeCreativeCloud"),
-        .init(displayName: "Microsoft AutoUpdate",
-              launchdLabel: "com.microsoft.update.agent"),
-    ]
 }
+
+/// Categorizes an app for the 3-tier Settings UI.
+enum ProcessCategory {
+    case userApp        // top-level GUI app with bundle id
+    case helper(parent: String)  // helper/renderer/gpu sub-process; `parent` = best-guess parent group key
+    case systemDaemon   // UID < 500, locked
+
+    /// Decide category from AppStat. `allBundleIds` lets us detect helper relationships:
+    /// if `app.bundleId` is a strict prefix-child of another app's bundle id, it's a helper.
+    static func categorize(_ app: AppStat, allBundleIds: Set<String>) -> ProcessCategory {
+        if app.isSystem { return .systemDaemon }
+
+        // Find longest known bundle id that is a strict parent of this one.
+        // E.g. allBundleIds = ["com.google.Chrome", "com.google.Chrome.helper.Renderer"]
+        // → helper.Renderer is child, parent = com.google.Chrome.
+        var bestParent: String?
+        for candidate in allBundleIds {
+            guard candidate != app.bundleId else { continue }
+            guard app.bundleId.hasPrefix(candidate + ".") else { continue }
+            if bestParent == nil || candidate.count > bestParent!.count {
+                bestParent = candidate
+            }
+        }
+        if let parent = bestParent {
+            return .helper(parent: parent)
+        }
+
+        // Heuristic fallback for known helper naming when parent not present (parent crashed/quit).
+        let lowered = app.bundleId.lowercased()
+        if lowered.contains(".helper") || lowered.contains(".gpu") || lowered.contains(".renderer")
+            || lowered.contains(".plugin") || lowered.contains(".webcontent") {
+            // Synthesize a parent group key by stripping the suffix after last `.` until base.
+            let parts = app.bundleId.split(separator: ".")
+            if parts.count >= 3 {
+                let parent = parts.prefix(3).joined(separator: ".")
+                return .helper(parent: parent)
+            }
+        }
+
+        return .userApp
+    }
+}
+

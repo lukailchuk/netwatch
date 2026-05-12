@@ -32,6 +32,7 @@ struct MenubarView: View {
         Group {
             if inSettings {
                 SettingsView()
+                    .environmentObject(monitor)
                     .transition(.opacity)
             } else {
                 switch selectedPeriod {

@@ -531,9 +531,34 @@ final class TrafficMonitor: ObservableObject {
 
         self.todayTotal = stats.reduce(Int64(0)) { $0 + $1.total }
         self.weekTotal = week.reduce(Int64(0)) { $0 + $1.total }
+
+        // Default-deny enforcement: pause any newly-appeared bundles not in whitelist.
+        // Fire-and-forget — UI shouldn't block on this. No-op when Travel Mode off.
+        let snapshot = self.apps
+        Task { await TravelModeManager.shared.reconcile(currentApps: snapshot) }
     }
 
     private func refreshStats() {
         refreshAppsFromDB(rates: [:], pids: [:], system: [:])
+    }
+
+    // MARK: - Aggregates for UI grouping
+
+    /// Sum of bytes/rate across system daemons (UID < 500). Used by SystemAggregateRow
+    /// to show users what they can't pause but is still eating their bandwidth.
+    var systemAggregate: (bytesIn: Int64, bytesOut: Int64, rate: Double, count: Int) {
+        let sys = apps.filter { $0.isSystem }
+        let bytesIn = sys.reduce(Int64(0)) { $0 + $1.bytesIn }
+        let bytesOut = sys.reduce(Int64(0)) { $0 + $1.bytesOut }
+        let rate = sys.reduce(0.0) { $0 + $1.rate }
+        return (bytesIn, bytesOut, rate, sys.count)
+    }
+
+    var systemApps: [AppStat] {
+        apps.filter { $0.isSystem }.sorted { $0.total > $1.total }
+    }
+
+    var userApps: [AppStat] {
+        apps.filter { !$0.isSystem }
     }
 }

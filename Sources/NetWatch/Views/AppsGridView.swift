@@ -13,9 +13,14 @@ struct AppsGridView: View {
                     emptyState
                         .padding(.top, Spacing.xxxl)
                 } else {
+                    // Split: user-controllable apps in the main grid, system daemons aggregated below.
+                    // We can't SIGSTOP system procs anyway (UID < 500), so individual rows for each
+                    // would be noise. The aggregate keeps them VISIBLE (so user knows what's eating
+                    // bandwidth) without cluttering the actionable list.
+                    let userApps = monitor.userApps
                     let pausedSet = monitor.pausedBundles
-                    let paused = monitor.apps.filter { pausedSet.contains($0.bundleId) }
-                    let active = monitor.apps.filter { !pausedSet.contains($0.bundleId) }
+                    let paused = userApps.filter { pausedSet.contains($0.bundleId) }
+                    let active = userApps.filter { !pausedSet.contains($0.bundleId) }
 
                     if !paused.isEmpty {
                         sectionHeader(title: "Paused", count: paused.count, accent: Palette.warning)
@@ -31,6 +36,18 @@ struct AppsGridView: View {
                         ForEach(active.prefix(25)) { app in
                             rowEntry(app: app)
                         }
+                    }
+
+                    let sysAgg = monitor.systemAggregate
+                    if sysAgg.count > 0 {
+                        SystemAggregateRow(
+                            bytesIn: sysAgg.bytesIn,
+                            bytesOut: sysAgg.bytesOut,
+                            rate: sysAgg.rate,
+                            count: sysAgg.count,
+                            topApps: Array(monitor.systemApps.prefix(10))
+                        )
+                        .padding(.top, Spacing.sm)
                     }
                 }
             }
@@ -342,4 +359,135 @@ struct AppRow: View {
             .help(help)
     }
 
+}
+
+/// Collapsed-by-default aggregate row for system daemons (UID < 500). We can't pause them
+/// (macOS blocks SIGSTOP for system procs), but the user still wants to SEE who's eating
+/// their bandwidth — that's the whole point of this row.
+struct SystemAggregateRow: View {
+    let bytesIn: Int64
+    let bytesOut: Int64
+    let rate: Double
+    let count: Int
+    let topApps: [AppStat]
+
+    @State private var isExpanded: Bool = false
+
+    private var total: Int64 { bytesIn + bytesOut }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            if isExpanded {
+                breakdown
+            }
+        }
+    }
+
+    private var header: some View {
+        Button {
+            withAnimation(.netExpand) { isExpanded.toggle() }
+        } label: {
+            HStack(spacing: Spacing.md) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 10)
+                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    .animation(.netToggle, value: isExpanded)
+
+                ZStack {
+                    RoundedRectangle(cornerRadius: Radius.sm, style: .continuous)
+                        .fill(Color.secondary.opacity(0.12))
+                        .frame(width: 30, height: 30)
+                    Image(systemName: "gearshape.2.fill")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 4) {
+                        Text("System processes")
+                            .font(.netRowPrimary)
+                            .foregroundStyle(.primary)
+                        Image(systemName: "lock.fill")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    Text("\(count) daemons · managed by macOS, can't be paused")
+                        .font(.netRowSecondary)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: Spacing.sm)
+
+                VStack(alignment: .trailing, spacing: 2) {
+                    if rate >= 100 {
+                        HStack(spacing: 4) {
+                            Circle()
+                                .fill(Color.secondary.opacity(0.6))
+                                .frame(width: 5, height: 5)
+                            Text(rate.formattedRate())
+                                .font(.netMono)
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                    }
+                    Text(total.formattedBytes())
+                        .font(.netMonoSm)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                .frame(minWidth: 84, alignment: .trailing)
+            }
+            .padding(.horizontal, Spacing.md)
+            .padding(.vertical, Spacing.sm + 2)
+            .contentShape(Rectangle())
+            .background {
+                RoundedRectangle(cornerRadius: Radius.sm, style: .continuous)
+                    .fill(Color.secondary.opacity(0.04))
+            }
+        }
+        .buttonStyle(.plain)
+        .help("Tap to see which system processes are using bandwidth")
+    }
+
+    private var breakdown: some View {
+        VStack(spacing: 1) {
+            ForEach(topApps) { app in
+                HStack(spacing: Spacing.md) {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 10)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(app.appName)
+                            .font(.netRowPrimary)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Text(app.bundleId)
+                            .font(.netRowSecondary)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer()
+                    Text(app.total.formattedBytes())
+                        .font(.netMonoSm)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                .padding(.horizontal, Spacing.md + 24)
+                .padding(.vertical, Spacing.xs + 1)
+            }
+            if topApps.count == 10 {
+                Text("Top 10 shown. See Settings → System Daemons for the full list.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, Spacing.md + 24)
+                    .padding(.top, Spacing.xs)
+            }
+        }
+    }
 }
