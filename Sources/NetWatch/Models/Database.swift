@@ -8,6 +8,17 @@ final class Database: @unchecked Sendable {
     private let queue = DispatchQueue(label: "netwatch.db", qos: .utility)
     private let path: String
 
+    /// POSIX locale + dateFormat keeps date keys ASCII-only on devices configured with
+    /// non-Latin Number formats (Arabic Indic, Persian, Thai). Without this, writes use
+    /// one numeric script and reads use another → daily aggregates silently mismatch.
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = .current
+        return f
+    }()
+
     private init() {
         let appSupport = FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)
@@ -62,11 +73,10 @@ final class Database: @unchecked Sendable {
 
     /// Record a delta of bytes for an app on a specific date.
     func recordDelta(bundleId: String, appName: String, deltaIn: Int64, deltaOut: Int64) {
+        // Capture date at call site, not inside async block — otherwise a delta sampled
+        // at 23:59:58 can land in tomorrow's bucket if the queue lags across midnight.
+        let date = Self.dateFormatter.string(from: Date())
         queue.async {
-            let formatter = DateFormatter()
-            formatter.dateFormat = "yyyy-MM-dd"
-            let date = formatter.string(from: Date())
-
             let sql = """
                 INSERT INTO daily_aggregates (date, bundle_id, app_name, bytes_in, bytes_out)
                 VALUES (?, ?, ?, ?, ?)
@@ -89,9 +99,7 @@ final class Database: @unchecked Sendable {
     }
 
     func getTodayStats() -> [AppStat] {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
-        return getDayStats(date: formatter.string(from: Date()))
+        return getDayStats(date: Self.dateFormatter.string(from: Date()))
     }
 
     func getDayStats(date: String) -> [AppStat] {
@@ -129,13 +137,11 @@ final class Database: @unchecked Sendable {
 
     func getAppTotalsForWeek() -> [PeriodApp] {
         let calendar = Calendar.current
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
 
         var dates: [String] = []
         for i in (0..<7).reversed() {
             if let d = calendar.date(byAdding: .day, value: -i, to: Date()) {
-                dates.append(formatter.string(from: d))
+                dates.append(Self.dateFormatter.string(from: d))
             }
         }
         guard !dates.isEmpty else { return [] }
@@ -170,34 +176,39 @@ final class Database: @unchecked Sendable {
 
     func getWeeklyTotals() -> [(date: String, total: Int64)] {
         let calendar = Calendar.current
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
 
         var dates: [String] = []
         for i in (0..<7).reversed() {
             if let d = calendar.date(byAdding: .day, value: -i, to: Date()) {
-                dates.append(formatter.string(from: d))
+                dates.append(Self.dateFormatter.string(from: d))
+            }
+        }
+        guard !dates.isEmpty else { return [] }
+
+        var totalsByDate: [String: Int64] = [:]
+        queue.sync {
+            let placeholders = dates.map { _ in "?" }.joined(separator: ",")
+            let sql = """
+                SELECT date, SUM(bytes_in + bytes_out)
+                FROM daily_aggregates
+                WHERE date IN (\(placeholders))
+                GROUP BY date
+            """
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(self.db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+
+            for (i, date) in dates.enumerated() {
+                sqlite3_bind_text(stmt, Int32(i + 1), (date as NSString).utf8String, -1, nil)
+            }
+
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let date = String(cString: sqlite3_column_text(stmt, 0))
+                let total = sqlite3_column_int64(stmt, 1)
+                totalsByDate[date] = total
             }
         }
 
-        var results: [(date: String, total: Int64)] = []
-        queue.sync {
-            for date in dates {
-                let sql = """
-                    SELECT COALESCE(SUM(bytes_in + bytes_out), 0)
-                    FROM daily_aggregates
-                    WHERE date = ?
-                """
-                var stmt: OpaquePointer?
-                if sqlite3_prepare_v2(self.db, sql, -1, &stmt, nil) == SQLITE_OK {
-                    sqlite3_bind_text(stmt, 1, (date as NSString).utf8String, -1, nil)
-                    if sqlite3_step(stmt) == SQLITE_ROW {
-                        results.append((date: date, total: sqlite3_column_int64(stmt, 0)))
-                    }
-                }
-                sqlite3_finalize(stmt)
-            }
-        }
-        return results
+        return dates.map { (date: $0, total: totalsByDate[$0] ?? 0) }
     }
 }

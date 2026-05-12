@@ -62,10 +62,27 @@ final class TrafficMonitor: ObservableObject {
     private var sessionAppBytes: [String: Int64] = [:]
     private var sessionConnBytes: [String: [String: Int64]] = [:]
 
+    /// Counts consecutive samples in which a tracked bundleId was absent from nettop.
+    /// Used to GC `lastAppSnapshot`/`lastConnSnapshot` entries for dead apps so they
+    /// don't bloat memory or pollute rate calc when a PID is reused by a new process.
+    private var snapshotMissCount: [String: Int] = [:]
+    private static let snapshotMissThreshold = 5  // ~35 sec absent → drop entry
+
     /// When false, parser skips the (expensive) per-connection rows entirely —
     /// they account for ~80% of nettop output volume in default mode.
     /// UI flips this to true while any app row is expanded.
-    var drilldownActive: Bool = false
+    var drilldownActive: Bool = false {
+        didSet {
+            // Toggling drilldown back ON would otherwise diff the new sample against
+            // counters frozen at the last "ON" sample — collapsing ALL traffic during
+            // the OFF window into one tick. That fakes a rate spike and inflates
+            // sessionConnBytes. Purge so the first post-toggle sample becomes the
+            // new baseline (zero delta), and real traffic accrues from then on.
+            if drilldownActive && !oldValue {
+                lastConnSnapshot.removeAll()
+            }
+        }
+    }
 
     private var sampleTimer: Timer?
     private var lastSampleAt: Date = Date()
@@ -421,6 +438,28 @@ final class TrafficMonitor: ObservableObject {
             }
             lastConnSnapshot[bundleId] = newPrev
             newConnStats[bundleId] = stats.sorted { $0.rate > $1.rate || ($0.rate == $1.rate && $0.sessionBytes > $1.sessionBytes) }
+        }
+
+        // GC stale snapshot entries — drop apps absent from nettop for N samples.
+        // Paused apps are intentionally frozen (SIGSTOP'd) and won't emit; keep them
+        // so resume picks up an accurate baseline instead of treating their counters
+        // as fresh wraps.
+        let activeBundleIds = Set(appSample.keys)
+        let pausedSet = AppController.pausedBundlesSnapshot()
+        let tracked = Set(lastAppSnapshot.keys).union(lastConnSnapshot.keys)
+        for bundleId in tracked {
+            if activeBundleIds.contains(bundleId) || pausedSet[bundleId] != nil {
+                snapshotMissCount.removeValue(forKey: bundleId)
+            } else {
+                let count = (snapshotMissCount[bundleId] ?? 0) + 1
+                if count >= Self.snapshotMissThreshold {
+                    lastAppSnapshot.removeValue(forKey: bundleId)
+                    lastConnSnapshot.removeValue(forKey: bundleId)
+                    snapshotMissCount.removeValue(forKey: bundleId)
+                } else {
+                    snapshotMissCount[bundleId] = count
+                }
+            }
         }
 
         // Publish UI state
