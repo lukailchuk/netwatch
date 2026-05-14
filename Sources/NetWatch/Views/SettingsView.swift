@@ -219,15 +219,11 @@ struct SettingsView: View {
     }
 
     private func appToggleRow(app: AppStat, isHelper: Bool) -> some View {
-        let isAllowed = TravelWhitelistStore.isAllowed(app.bundleId, in: whitelist)
-        return HStack(spacing: Spacing.md) {
-            Toggle("", isOn: Binding(
-                get: { isAllowed },
-                set: { newValue in toggleAllow(app.bundleId, newValue: newValue) }
-            ))
-            .labelsHidden()
-            .toggleStyle(.switch)
-            .controlSize(.small)
+        HStack(spacing: Spacing.md) {
+            Toggle("", isOn: whitelistBinding(for: app.bundleId))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(app.appName)
@@ -255,16 +251,12 @@ struct SettingsView: View {
     private func helperGroupRow(parent: String, members: [AppStat]) -> some View {
         // Group toggle keys on `parent` — that's the canonical whitelist entry that
         // inheritance (TravelWhitelistStore.isAllowed prefix match) consults.
-        let isAllowed = TravelWhitelistStore.isAllowed(parent, in: whitelist)
         let totalBytes = members.reduce(Int64(0)) { $0 + $1.total }
         return HStack(spacing: Spacing.md) {
-            Toggle("", isOn: Binding(
-                get: { isAllowed },
-                set: { newValue in toggleAllow(parent, newValue: newValue) }
-            ))
-            .labelsHidden()
-            .toggleStyle(.switch)
-            .controlSize(.small)
+            Toggle("", isOn: whitelistBinding(for: parent))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(parent.split(separator: ".").last.map(String.init) ?? parent)
@@ -328,6 +320,13 @@ struct SettingsView: View {
             }
             whitelist = TravelWhitelistStore.load()
         }
+    }
+
+    private func whitelistBinding(for key: String) -> Binding<Bool> {
+        Binding(
+            get: { TravelWhitelistStore.isAllowed(key, in: self.whitelist) },
+            set: { self.toggleAllow(key, newValue: $0) }
+        )
     }
 }
 

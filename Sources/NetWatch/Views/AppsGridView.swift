@@ -41,10 +41,7 @@ struct AppsGridView: View {
                     let sysAgg = monitor.systemAggregate
                     if sysAgg.count > 0 {
                         SystemAggregateRow(
-                            bytesIn: sysAgg.bytesIn,
-                            bytesOut: sysAgg.bytesOut,
-                            rate: sysAgg.rate,
-                            count: sysAgg.count,
+                            aggregate: sysAgg,
                             topApps: Array(monitor.systemApps.prefix(10))
                         )
                         .padding(.top, Spacing.sm)
@@ -365,15 +362,12 @@ struct AppRow: View {
 /// (macOS blocks SIGSTOP for system procs), but the user still wants to SEE who's eating
 /// their bandwidth — that's the whole point of this row.
 struct SystemAggregateRow: View {
-    let bytesIn: Int64
-    let bytesOut: Int64
-    let rate: Double
-    let count: Int
+    let aggregate: (bytesIn: Int64, bytesOut: Int64, rate: Double, count: Int)
     let topApps: [AppStat]
 
     @State private var isExpanded: Bool = false
 
-    private var total: Int64 { bytesIn + bytesOut }
+    private var total: Int64 { aggregate.bytesIn + aggregate.bytesOut }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -414,7 +408,7 @@ struct SystemAggregateRow: View {
                             .font(.system(size: 9, weight: .semibold))
                             .foregroundStyle(.tertiary)
                     }
-                    Text("\(count) daemons · managed by macOS, can't be paused")
+                    Text("\(aggregate.count) daemons · managed by macOS, can't be paused")
                         .font(.netRowSecondary)
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
@@ -423,12 +417,12 @@ struct SystemAggregateRow: View {
                 Spacer(minLength: Spacing.sm)
 
                 VStack(alignment: .trailing, spacing: 2) {
-                    if rate >= 100 {
+                    if aggregate.rate >= 100 {
                         HStack(spacing: 4) {
                             Circle()
                                 .fill(Color.secondary.opacity(0.6))
                                 .frame(width: 5, height: 5)
-                            Text(rate.formattedRate())
+                            Text(aggregate.rate.formattedRate())
                                 .font(.netMono)
                                 .foregroundStyle(.secondary)
                                 .monospacedDigit()

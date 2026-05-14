@@ -22,6 +22,7 @@ enum TravelWhitelistStore {
     @discardableResult
     static func allow(_ key: String) -> Set<String> {
         var s = load()
+        guard !s.contains(key) else { return s }
         s.insert(key)
         save(s)
         return s
@@ -31,6 +32,7 @@ enum TravelWhitelistStore {
     @discardableResult
     static func disallow(_ key: String) -> Set<String> {
         var s = load()
+        guard s.contains(key) else { return s }
         s.remove(key)
         save(s)
         return s
@@ -51,23 +53,28 @@ enum TravelWhitelistStore {
 /// always run, no matter what user did with the whitelist. Prevents the worst case: pausing
 /// the UI you're using to manage pause state.
 enum TravelBaseline {
+    /// Always-allowed terminals. Edit this set when adding new terminal apps to protect.
+    static let terminalBundleIds: Set<String> = [
+        "com.apple.Terminal",
+        "com.googlecode.iterm2",
+        "dev.warp.Warp-Stable",
+        "co.zeit.hyper",
+        "io.alacritty",
+        "net.kovidgoyal.kitty",
+    ]
+
     /// Bundle IDs that are ALWAYS allowed during Travel Mode (in addition to user whitelist).
     /// Computed at activation time (frontmost can change). Not persisted.
     @MainActor
     static func compute() -> Set<String> {
         var s: Set<String> = []
-        // NetWatch itself — without this we pause our own UI and can't recover.
         if let me = Bundle.main.bundleIdentifier { s.insert(me) }
-        // Whoever's in focus when user hit the button — current work, don't break it.
         if let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier {
             s.insert(front)
         }
-        // Active terminal — likely running build/dev workflow.
         for app in NSWorkspace.shared.runningApplications {
             guard let bid = app.bundleIdentifier else { continue }
-            if bid == "com.apple.Terminal" || bid == "com.googlecode.iterm2" || bid == "dev.warp.Warp-Stable" {
-                s.insert(bid)
-            }
+            if terminalBundleIds.contains(bid) { s.insert(bid) }
         }
         return s
     }
@@ -75,35 +82,39 @@ enum TravelBaseline {
 
 /// Categorizes an app for the 3-tier Settings UI.
 enum ProcessCategory {
-    case userApp        // top-level GUI app with bundle id
-    case helper(parent: String)  // helper/renderer/gpu sub-process; `parent` = best-guess parent group key
-    case systemDaemon   // UID < 500, locked
+    case userApp
+    case helper(parent: String)
+    case systemDaemon
+
+    /// Substrings that mark a bundle id as a helper when no explicit parent is in the running set.
+    private static let helperSuffixes: [String] = [
+        ".helper", ".gpu", ".renderer", ".plugin", ".webcontent",
+    ]
 
     /// Decide category from AppStat. `allBundleIds` lets us detect helper relationships:
     /// if `app.bundleId` is a strict prefix-child of another app's bundle id, it's a helper.
     static func categorize(_ app: AppStat, allBundleIds: Set<String>) -> ProcessCategory {
         if app.isSystem { return .systemDaemon }
 
-        // Find longest known bundle id that is a strict parent of this one.
-        // E.g. allBundleIds = ["com.google.Chrome", "com.google.Chrome.helper.Renderer"]
-        // → helper.Renderer is child, parent = com.google.Chrome.
+        // Longest known bundle id that is a strict parent of this one wins.
+        // E.g. ["com.google.Chrome", "com.google.Chrome.helper.Renderer"] → parent is "com.google.Chrome".
         var bestParent: String?
+        var bestLength = 0
         for candidate in allBundleIds {
-            guard candidate != app.bundleId else { continue }
-            guard app.bundleId.hasPrefix(candidate + ".") else { continue }
-            if bestParent == nil || candidate.count > bestParent!.count {
-                bestParent = candidate
-            }
+            guard candidate != app.bundleId,
+                  app.bundleId.hasPrefix(candidate + "."),
+                  candidate.count > bestLength
+            else { continue }
+            bestParent = candidate
+            bestLength = candidate.count
         }
         if let parent = bestParent {
             return .helper(parent: parent)
         }
 
-        // Heuristic fallback for known helper naming when parent not present (parent crashed/quit).
+        // Parent isn't in the running set (crashed/quit) — fall back to naming convention.
         let lowered = app.bundleId.lowercased()
-        if lowered.contains(".helper") || lowered.contains(".gpu") || lowered.contains(".renderer")
-            || lowered.contains(".plugin") || lowered.contains(".webcontent") {
-            // Synthesize a parent group key by stripping the suffix after last `.` until base.
+        if Self.helperSuffixes.contains(where: { lowered.contains($0) }) {
             let parts = app.bundleId.split(separator: ".")
             if parts.count >= 3 {
                 let parent = parts.prefix(3).joined(separator: ".")

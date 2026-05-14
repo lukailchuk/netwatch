@@ -21,6 +21,11 @@ final class TravelModeManager: ObservableObject {
     /// Not persisted — clears on deactivate. User intent: "I just opened it, I want it."
     private var sessionWhitelist: Set<String> = []
 
+    /// Baseline frozen at activation. Avoids walking NSWorkspace.runningApplications every
+    /// 7s reconcile tick. Foreground app captured at activation time stays allowed for the
+    /// whole session — switching focus mid-Travel does NOT extend the allow list.
+    private var activationBaseline: Set<String>?
+
     /// NSWorkspace observer token, kept so we can unsubscribe on deactivate.
     private var launchObserver: NSObjectProtocol?
 
@@ -29,6 +34,7 @@ final class TravelModeManager: ObservableObject {
     // MARK: - Lifecycle
 
     func activate() async {
+        activationBaseline = TravelBaseline.compute()
         let whitelist = effectiveWhitelist()
         log.info("activate: whitelist size \(whitelist.count)")
 
@@ -67,6 +73,7 @@ final class TravelModeManager: ObservableObject {
 
         sessionPausedBundles.removeAll()
         sessionWhitelist.removeAll()
+        activationBaseline = nil
         isActive = false
     }
 
@@ -144,9 +151,11 @@ final class TravelModeManager: ObservableObject {
     // MARK: - Helpers
 
     /// User whitelist ∪ activation-time baseline ∪ session auto-launches.
+    /// Uses the cached baseline while active; otherwise computes fresh (e.g. preview before activate).
     private func effectiveWhitelist() -> Set<String> {
-        TravelWhitelistStore.load()
-            .union(TravelBaseline.compute())
+        let baseline = activationBaseline ?? TravelBaseline.compute()
+        return TravelWhitelistStore.load()
+            .union(baseline)
             .union(sessionWhitelist)
     }
 
